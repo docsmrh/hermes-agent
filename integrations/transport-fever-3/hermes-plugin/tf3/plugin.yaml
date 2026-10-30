@@ -1,0 +1,19 @@
+name: tf3
+version: 0.1.0
+description: "Observe, control and autonomously play Transport Fever 3 on your Mac through the hermes_bridge TF3 mod (reached over an SSH reverse tunnel)."
+author: docsmrh
+kind: standalone
+license: MIT
+platforms:
+  - linux
+  - macos
+requires_env:
+  - name: TF3_BRIDGE_TOKEN
+    description: "Bearer token printed by `tf3_relay.py init` on the Mac running Transport Fever 3"
+    secret: true
+provides_tools:
+  - tf3_observe
+  - tf3_screenshot
+  - tf3_act
+  - tf3_lua
+  - tf3_journal
