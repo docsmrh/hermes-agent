@@ -87,7 +87,7 @@ api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "hermes_bridge", "herm
 
 - **Engine side.** The engine `handleEvent` executes the op, unless `key` is already in its results, and records `{done, ok, result|error}` in the game-script state (`state:set`, bounded to 40 entries). The engine `update` subscribes to the event name.
 - **GUI side.** The GUI reads the result back through `stateReadOnly:get()`, falling back to the `GAME_SCRIPT` component of `hermes_bridge::/hermes_bridge/hermes_bridge.gs`.
-- **Paused game.** The simulation does not step while paused. A forwarded op that gets no result within 90 s fails with `engine_timeout`.
+- **Paused game.** The simulation does not step while paused, so a forwarded command would stay queued and run whenever the player resumes. The mod therefore refuses engine ops with `game_paused` while `GAME_SPEED.speedup` is 0. A forwarded op that still gets no result within 90 s fails with `engine_timeout`. That one is not retryable: the command may still run, so re-observe first. The plugin marks `timeout`, `engine_timeout` and `transport_error` on actions as `outcome: unknown`.
 
 ## Op table
 

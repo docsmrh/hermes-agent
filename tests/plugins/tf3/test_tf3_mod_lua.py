@@ -226,6 +226,16 @@ def test_lua_eval_and_save(channel, game):
         call(channel, "save_game", {"name": "../../evil"})
 
 
+def test_engine_ops_are_refused_while_paused(channel, game):
+    call(channel, "set_speed", {"speedup": 0})
+    with pytest.raises(R.RelayError) as exc:
+        call(channel, "vehicle_stop", {"vehicle_id": 500})
+    assert exc.value.code == "game_paused"
+    assert "vehicle_stopped" not in game.log_kinds()  # nothing queued to run on resume
+    call(channel, "set_speed", {"speedup": 1})
+    assert call(channel, "vehicle_stop", {"vehicle_id": 500})["result"]["accepted"]
+
+
 def test_paused_simulation_times_out_engine_ops(tmp_path):
     g = FakeGame(tmp_path / "userdata")
     ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01)

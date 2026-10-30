@@ -202,6 +202,22 @@ def test_act_reports_mod_errors(wired):
     assert ctx.state.get("action_log")[-1]["ok"] is False
 
 
+def test_act_timeout_reports_unknown_outcome(plugin, monkeypatch):
+    plugin.tools.bind(FakeCtx())
+    plugin.tools._budget = plugin.guardrails.ActionBudget()
+    real_client = plugin.client.BridgeClient
+
+    def timing_out(*args, **kwargs):
+        def handler(request):
+            raise httpx.ReadTimeout("slow")
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+    monkeypatch.setattr(plugin.tools, "BridgeClient", timing_out)
+    out = run(plugin, "tf3_act", {"action": "vehicle_buy", "params": {"depot_id": 1, "model": "m"}, "reason": "x"})
+    assert out["code"] == "timeout" and out["outcome"] == "unknown" and out["retryable"] is False
+    assert "Re-observe" in out["next_step"]
+
+
 def test_act_rejects_unknown_actions(wired):
     plugin, ctx, relay = wired
     out = run(plugin, "tf3_act", {"action": "lua_eval", "params": {}, "reason": "x"})

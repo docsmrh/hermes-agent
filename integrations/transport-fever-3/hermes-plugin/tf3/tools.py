@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 TOKEN_ENV = "TF3_BRIDGE_TOKEN"
 SNAPSHOT_SECTIONS = ("game", "finance", "lines", "vehicles", "stations", "depots", "towns", "industries", "problems")
 DEFAULT_SECTIONS = ["game", "finance", "lines", "problems"]
+# Errors after which the action may still take effect in the game.
+_OUTCOME_UNKNOWN = frozenset({"timeout", "engine_timeout", "transport_error"})
 _JOURNAL_MAX_ENTRIES = 300
 _JOURNAL_MAX_TEXT = 1500
 _PLAN_MAX_TEXT = 4000
@@ -373,6 +375,10 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
         if not dry_run:
             _record_action({"ts": _now_iso(), "session": session, "action": action, "params": params,
                             "reason": reason, "ok": False, "error": exc.to_dict()})
+        if exc.code in _OUTCOME_UNKNOWN and not dry_run:
+            # The game may still carry the action out; a blind retry could do it twice.
+            return tool_error(exc.message, code=exc.code, retryable=False, outcome="unknown",
+                              next_step="Re-observe and check whether the change happened before retrying.")
         raise
     if not dry_run:
         _record_action({"ts": _now_iso(), "session": session, "action": action, "params": params,

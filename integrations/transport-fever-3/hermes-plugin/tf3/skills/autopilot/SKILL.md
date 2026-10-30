@@ -80,8 +80,9 @@ for 3–8 actions, not 30.
 
 ## Pitfalls
 
-- Commands are asynchronous: they run on the next simulation step. If the game
-  is paused, the result may report `pending` — set speed to 1 and re-check.
+- While the game is paused, actions fail with `game_paused` and nothing is
+  done: `set_speed {speedup: 1}` first. An action that fails with
+  `outcome: unknown` (a timeout) may still happen — re-observe before retrying.
 - Entity ids are stable only within one loaded save. After the user loads a
   different save, the journal's ids are stale; re-observe before acting.
 - Do not bulldoze or sell to "clean up" without evidence from `tf3_observe`

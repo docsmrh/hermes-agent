@@ -229,7 +229,24 @@ end
 
 -- GUI loop ---------------------------------------------------------------------
 
+-- While the game is paused the simulation does not step, so a forwarded
+-- command would sit in the queue and run whenever the player resumes —
+-- long after the agent was told it timed out. Refuse it up front instead.
+local function game_paused()
+  local world = util.try(util.path(api, 'engine.util.getWorld'))
+  local ct = util.path(api, 'type.ComponentType.GAME_SPEED')
+  local exists = util.path(api, 'engine.entityExists')
+  if world == nil or ct == nil or (exists and util.try(exists, world) ~= true) then return false end
+  local gs = util.try(api.engine.getComponent, world, ct)
+  return gs ~= nil and util.try(function() return gs.speedup == 0 end) == true
+end
+
 local function forward(rec, op, args)
+  if game_paused() then
+    complete(rec, false, { code = 'game_paused', retryable = true,
+      message = 'the game is paused; nothing was done. Resume with set_speed {speedup: 1} first.' })
+    return
+  end
   local make = util.path(api, 'cmd.makeScriptingSendEventCmd')
   local sendCommand = util.path(api, 'cmd.sendCommand')
   if type(make) ~= 'function' or type(sendCommand) ~= 'function' then
@@ -321,8 +338,9 @@ local function collect_engine_results(state_ro)
       if type(res) == 'table' and res.done then
         complete(rec, res.ok, res.ok and res.result or res.error)
       elseif now - (rec.sent_t or now) > ENGINE_TIMEOUT_S then
-        complete(rec, false, { code = 'engine_timeout', retryable = true,
-          message = 'the simulation did not run the command; is the game paused? (set_speed 1 resumes)' })
+        complete(rec, false, { code = 'engine_timeout', retryable = false,
+          message = 'the simulation has not run the command yet; it is still queued and may run later. '
+            .. 'Re-observe before retrying so it is not done twice.' })
       end
     end
   end
