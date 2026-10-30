@@ -73,10 +73,11 @@ local function vec3f(t, what)
 end
 
 -- Send a command; report success/failure through finish. `extract` maps the
--- executed command data to the op's result.
+-- executed command data to the op's result. The game sometimes throws
+-- instead of refusing a command, so a throw is reported as a refusal.
 local function send(cmd, finish, extract)
   local sendCommand = need_fn('cmd.sendCommand')
-  sendCommand(cmd, function(data, success, result_entities)
+  local ok, err = pcall(sendCommand, cmd, function(data, success, result_entities)
     if not success then
       fail(finish, 'command_failed', 'the game rejected the command')
       return
@@ -90,6 +91,7 @@ local function send(cmd, finish, extract)
     end
     finish(true, result)
   end)
+  if not ok then fail(finish, 'command_failed', 'the game refused the command: ' .. tostring(err)) end
 end
 
 local function current_year()
@@ -173,19 +175,40 @@ function ops.selftest(args, finish)
                  line_stop_index_base = index_base })
 end
 
+-- Availability years come from the model metadata (modelRep.get is not in
+-- the ModelRep typedef, so it is optional); 0 means "no end year".
+local function model_info(file_name, year)
+  local find = util.path(api, 'res.modelRep.find')
+  local id = find and util.try(find, file_name) or nil
+  local info = { file = file_name, id = id }
+  local get = util.path(api, 'res.modelRep.get')
+  local md = get and type(id) == 'number' and id >= 0 and util.try(function() return get(id).metadata end) or nil
+  if md ~= nil then
+    info.year_from = util.try(function() return md.availability.yearFrom end)
+    info.year_to = util.try(function() return md.availability.yearTo end)
+    info.price = util.try(function() return md.cost.price end)
+    if type(year) == 'number' then
+      local from, to = tonumber(info.year_from) or 0, tonumber(info.year_to) or 0
+      info.available = (from == 0 or from <= year) and (to == 0 or to > year)
+    end
+  end
+  return info
+end
+
 function ops.list_vehicle_models(args, finish)
   local each = need_fn('res.modelRep.forEachModelWithMetadata')
-  local find = util.path(api, 'res.modelRep.find')
   local filter = type(args.contains) == 'string' and args.contains:lower() or nil
   local limit = util.clamp_int(args.limit, 1, 500, 200)
+  local year = current_year()
   local models, total = {}, 0
   each(args.metadata or 'transportVehicle', function(file_name)
     total = total + 1
     if #models < limit and (filter == nil or tostring(file_name):lower():find(filter, 1, true)) then
-      models[#models + 1] = { file = file_name, id = find and util.try(find, file_name) or nil }
+      local info = model_info(file_name, year)
+      if not (args.available_only == true and info.available == false) then models[#models + 1] = info end
     end
   end)
-  finish(true, { models = models, total = total })
+  finish(true, { models = models, total = total, year = year })
 end
 
 -- Camera / screenshots (view ops: no game-state change) -----------------------
@@ -315,6 +338,7 @@ end
 -- community mods); fall back to assembling the documented struct by hand.
 local function make_part(id)
   local vu = util.try(ug_require, '/gui/line_vehicle_mgmt/vehicle_util.tl')
+    or util.try(ug_require, '::/gui/line_vehicle_mgmt/vehicle_util.tl')
   local part = vu and util.try(vu.makePart, id, true, nil)
   if part == nil then
     part = need_fn('type.TransportVehiclePart.new')()
@@ -327,8 +351,19 @@ end
 
 -- EXPERIMENTAL: TransportVehicleConfig assembly follows the documented fields
 -- (vehicles, vehicleGroups, muFileNames); unverified on the live game.
+-- Accept a depot entity, or a construction that contains one (what
+-- build_construction returns), and resolve it to the depot entity.
+local function resolve_depot(args)
+  local id = need_entity(args, 'depot_id')
+  if snapshot.component(id, 'VEHICLE_DEPOT') ~= nil then return id end
+  local con = snapshot.component(id, 'CONSTRUCTION')
+  local depots = con and util.list(util.try(function() return con.depots end)) or {}
+  if depots[1] ~= nil and exists(depots[1]) then return depots[1] end
+  error({ code = 'invalid_argument', message = 'depot_id ' .. id .. ' is not a depot (or a depot construction)' }, 0)
+end
+
 function ops.vehicle_buy(args, finish)
-  local depot = need_entity(args, 'depot_id', 'VEHICLE_DEPOT')
+  local depot = resolve_depot(args)
   local parts_spec = args.models or { args.model }
   if type(parts_spec) ~= 'table' or #parts_spec == 0 or #parts_spec > 40 then
     return fail(finish, 'invalid_argument', 'model (or models: up to 40 parts for a train) is required')
@@ -420,19 +455,30 @@ local function build_proposal(proposal, args, finish, description)
   -- form used by working community mods from the simulation side.
   local cmd = need_fn('cmd.makeWorldBuildProposalCmd')(proposal, nil, args.ignore_errors == true, true)
   local sendCommand = need_fn('cmd.sendCommand')
-  sendCommand(cmd, function(data, success, result_entities)
+  local ok, err = pcall(sendCommand, cmd, function(data, success, result_entities)
     if not success then
       local errors = proposal_errors(util.try(function() return data.resultProposalData end))
       finish(false, { code = 'command_failed', message = 'the game rejected the proposal', errors = errors })
       return
     end
-    local ids = {}
+    -- Report the depots/stations inside new constructions: vehicle_buy and
+    -- line_create need those entities, not the construction itself.
+    local ids, depots, stations = util.list(nil), util.list(nil), util.list(nil)
     for _, pair in ipairs(util.list(result_entities)) do
       local e = util.try(function() return pair[1] end)
-      if e ~= nil then ids[#ids + 1] = e end
+      if e == nil then e = util.try(function() return pair:at(1) end) end
+      if e ~= nil then
+        ids[#ids + 1] = e
+        local con = snapshot.component(e, 'CONSTRUCTION')
+        if con ~= nil then
+          for _, d in ipairs(util.list(util.try(function() return con.depots end))) do depots[#depots + 1] = d end
+          for _, st in ipairs(util.list(util.try(function() return con.stations end))) do stations[#stations + 1] = st end
+        end
+      end
     end
-    finish(true, { accepted = true, entity_ids = ids })
+    finish(true, { accepted = true, entity_ids = ids, depot_ids = depots, station_ids = stations })
   end)
+  if not ok then fail(finish, 'command_failed', 'the game refused the proposal: ' .. tostring(err)) end
 end
 
 -- EXPERIMENTAL: construction params are construction-specific (see the

@@ -13,6 +13,11 @@ return function(util)
 
 local M = {}
 
+local STATES = { 'IN_DEPOT', 'EN_ROUTE', 'AT_TERMINAL', 'GOING_TO_DEPOT' }
+local CARRIERS = { 'ROAD', 'RAIL', 'TRAM', 'AIR', 'WATER', 'OTHER' }
+local MODES = { 'PERSON', 'CARGO', 'CAR', 'BUS', 'TRUCK', 'TRAM', 'ELECTRIC_TRAM', 'TRAIN', 'ELECTRIC_TRAIN',
+                'AIRCRAFT', 'SHIP', 'SMALL_AIRCRAFT', 'SMALL_SHIP', 'HELICOPTER' }
+
 local function CT(name)
   return util.path(api, 'type.ComponentType.' .. name)
 end
@@ -171,14 +176,19 @@ function sections.lines(ctx)
     local comp = component(line, 'LINE')
     local vehicles = util.list(tvs and util.try(tvs.getLineVehicles, line))
     local stops = line_stops(comp)
-    local modes = {}
+    local modes = setmetatable({}, util.ARRAY_MT)
     local tm = comp and util.try(function() return comp.vehicleInfo.transportModes end)
-    if type(tm) == 'table' then
-      for mode, on in pairs(tm) do if on then modes[#modes + 1] = mode end end
+    if tm ~= nil then
+      pcall(function()
+        for mode, on in pairs(tm) do
+          if on then modes[#modes + 1] = util.enum_name('TransportMode', MODES, mode) end
+        end
+      end)
     end
+    -- A map keyed by cargo type (not a vector), so it is read with pairs.
     local usage = util.try(util.path(api, 'engine.util.line.getLineCapacityUsages'), line, false)
     local used, capacity = 0, 0
-    for _, u in ipairs(util.list(usage)) do
+    for _, u in ipairs(util.values(usage)) do
       used = used + (tonumber(util.try(function() return u.used end)) or 0)
       capacity = capacity + (tonumber(util.try(function() return u.capacity end)) or 0)
     end
@@ -198,7 +208,6 @@ end
 
 local function vehicle_record(v)
   local tv = component(v, 'TRANSPORT_VEHICLE')
-  local enum = util.path(api, 'type.enum')
   local state = tv and util.try(function() return tv.state end)
   local carrier = tv and util.try(function() return tv.carrier end)
   local vutil = util.path(api, 'engine.util.vehicle')
@@ -207,8 +216,8 @@ local function vehicle_record(v)
     name = name_of(v),
     line_id = tv and util.try(function() return tv.line end),
     depot_id = tv and util.try(function() return tv.depot end),
-    state = util.enum_name(enum and enum.TransportVehicleState, state),
-    carrier = util.enum_name(enum and enum.Carrier, carrier),
+    state = util.enum_name('TransportVehicleState', STATES, state),
+    carrier = util.enum_name('Carrier', CARRIERS, carrier),
     user_stopped = tv and util.try(function() return tv.userStopped end),
     no_path = tv and util.try(function() return tv.noPath end),
     stop_index = tv and util.try(function() return tv.stopIndex end),
@@ -241,7 +250,8 @@ function sections.stations(ctx)
   local ss = util.path(api, 'engine.system.stationSystem')
   local scs = util.path(api, 'engine.system.streetConnectorSystem')
   local ls = util.path(api, 'engine.system.lineSystem')
-  local usage = util.path(api, 'engine.util.calculateStationUsage')
+  local usage = util.path(api, 'engine.util.station.calculateStationUsage')
+    or util.path(api, 'engine.util.calculateStationUsage')
   local out = { count = 0, items = {} }
   for _, st in ipairs(entities_with('STATION', ctx.player)) do
     if owned_by(st, ctx.player) then
@@ -279,6 +289,7 @@ end
 
 function sections.depots(ctx)
   local tvs = util.path(api, 'engine.system.transportVehicleSystem')
+  local scs = util.path(api, 'engine.system.streetConnectorSystem')
   local out = { count = 0, items = {} }
   for _, depot in ipairs(entities_with('VEHICLE_DEPOT', ctx.player)) do
     if owned_by(depot, ctx.player) then
@@ -286,10 +297,12 @@ function sections.depots(ctx)
       if #out.items >= ctx.limit then
         out.truncated = true
       else
+        local con = scs and util.try(scs.getConstructionEntityForDepot, depot)
         out.items[#out.items + 1] = {
           id = depot,
           name = name_of(depot),
-          position = construction_position(depot),
+          construction_id = con,
+          position = construction_position(con or depot),
           vehicle_ids = util.list(tvs and util.try(tvs.getDepotVehicles, depot)),
         }
       end

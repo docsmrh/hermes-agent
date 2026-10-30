@@ -38,7 +38,8 @@ local MAX_LIST = 100000
 util.ARRAY_MT = { __jsontype = 'array' }
 
 -- Return the elements of an engine list (Lua array or native vector) as a
--- fresh 1-based Lua array.
+-- fresh 1-based Lua array. Native vectors are read as v:at(1..v:size()),
+-- the indexing working community mods use in the game.
 function util.list(v)
   local out = setmetatable({}, util.ARRAY_MT)
   if v == nil then return out end
@@ -52,20 +53,25 @@ function util.list(v)
   local n = util.try(function() return v:size() end)
   if type(n) ~= 'number' then n = util.try(function() return #v end) end
   if type(n) ~= 'number' or n <= 0 then return out end
-  n = math.min(n, MAX_LIST)
-  -- Native vectors are 0-based through :at(); fall back to 1-based indexing.
-  local first = util.try(function() return v:at(0) end)
-  if first ~= nil then
-    for i = 0, n - 1 do
-      local item = util.try(function() return v:at(i) end)
-      if item ~= nil then out[#out + 1] = item end
-    end
-    return out
-  end
-  for i = 1, n do
-    local item = util.try(function() return v[i] end)
+  for i = 1, math.min(n, MAX_LIST) do
+    local item = util.try(function() return v:at(i) end)
+    if item == nil then item = util.try(function() return v[i] end) end
     if item ~= nil then out[#out + 1] = item end
   end
+  return out
+end
+
+-- Values of a Lua table or a native *map* (pairs works on engine maps; never
+-- call this on a native vector).
+function util.values(m)
+  local out = setmetatable({}, util.ARRAY_MT)
+  if m == nil then return out end
+  pcall(function()
+    for _, item in pairs(m) do
+      out[#out + 1] = item
+      if #out >= MAX_LIST then break end
+    end
+  end)
   return out
 end
 
@@ -87,13 +93,30 @@ function util.round(n, digits)
   return math.floor(n * m + 0.5) / m
 end
 
--- Map an enum value back to its name when the enum is a plain Lua table.
-function util.enum_name(enum_table, value)
-  if type(enum_table) ~= 'table' or value == nil then return value end
-  for k, v in pairs(enum_table) do
-    if v == value then return k end
+-- Name of an api.type.enum.<enum_type> value, looked up through the known
+-- member names (enums cannot be listed with pairs on this game build).
+local enum_maps = {}
+function util.enum_name(enum_type, names, value)
+  if value == nil then return nil end
+  local map = enum_maps[enum_type]
+  if map == nil then
+    map = { _list = {} }
+    local enum = util.path(api, 'type.enum.' .. enum_type)
+    for _, name in ipairs(names) do
+      local v = enum ~= nil and util.try(function() return enum[name] end) or nil
+      if v ~= nil then
+        map[v] = name
+        map._list[#map._list + 1] = { v, name }
+      end
+    end
+    enum_maps[enum_type] = map
   end
-  return value
+  if map[value] ~= nil then return map[value] end
+  for _, pair in ipairs(map._list) do
+    if util.try(function() return pair[1] == value end) then return pair[2] end
+  end
+  if type(value) == 'number' or type(value) == 'string' then return value end
+  return util.try(tostring, value)
 end
 
 -- Bounded conversion of an arbitrary Lua/engine value into something

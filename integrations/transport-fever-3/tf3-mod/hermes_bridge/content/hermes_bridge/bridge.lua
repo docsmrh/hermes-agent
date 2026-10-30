@@ -354,11 +354,9 @@ end
 -- Engine side ------------------------------------------------------------------
 
 -- Script events are routed by NAME, and only to scripts subscribed to it.
+-- Re-subscribing on every step is what the base game's own scripts do.
 local function subscribe(state)
-  local subscribed = util.try(function() return state:hasEventSubscriptions() end)
-  if not subscribed then
-    pcall(function() state:subscribeToEvent(EVENT_NAME) end)
-  end
+  pcall(function() state:subscribeToEvent(EVENT_NAME) end)
 end
 
 function M.engine_update(state)

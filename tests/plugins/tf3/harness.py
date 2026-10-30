@@ -57,9 +57,11 @@ def load_plugin() -> types.ModuleType:
 
 
 class _NativeVector:
-    """Python object exposed to Lua as userdata with :size()/:at(i) (0-based),
-    like TF3's native vectors. Lua's colon call passes the object itself as
-    an extra first argument, hence the *args handling."""
+    """Python object exposed to Lua as userdata with :size() and :at(i),
+    1-based like TF3's native vectors (community mods iterate them as
+    ``for i = 1, v:size() do v:at(i) end``); out-of-range access raises.
+    Lua's colon call passes the object itself as an extra first argument,
+    hence the *args handling."""
 
     def __init__(self, items):
         self._items = list(items)
@@ -68,7 +70,10 @@ class _NativeVector:
         return len(self._items)
 
     def at(self, *args):
-        return self._items[int(args[-1])]
+        i = int(args[-1])
+        if not 1 <= i <= len(self._items):
+            raise IndexError(f"native vector index {i} out of range 1..{len(self._items)}")
+        return self._items[i - 1]
 
 
 class FakeGame:

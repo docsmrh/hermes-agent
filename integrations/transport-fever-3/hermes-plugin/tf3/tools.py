@@ -186,7 +186,10 @@ TF3_OBSERVE_SCHEMA = {
             },
             "model_search": {
                 "type": "string",
-                "description": "Optional: list vehicle model files whose path contains this text (e.g. 'bus', 'tram').",
+                "description": (
+                    "Optional: list vehicle model files whose path contains this text (e.g. 'bus', 'tram'), "
+                    "with id, availability years and whether each is available in the current game year."
+                ),
             },
             "selftest": {
                 "type": "boolean",
@@ -305,12 +308,13 @@ TF3_ACT_SCHEMA = {
         "set_speed {speedup:int 0-4, 0 = pause}; "
         "line_create {name, stops:[station_id,...] or [{station_id, terminal?},...], color?:[r,g,b] 0-1}; "
         "line_update {line_id, name?, stops?}; line_delete {line_id} (sell its vehicles first); "
-        "vehicle_buy {depot_id (from the depots section), model (file path from model_search) or "
-        "models:[...] for multi-part trains, line_id?}; "
+        "vehicle_buy {depot_id (a depot from the depots section, or a depot construction), model (file path "
+        "from model_search; pick one with available=true) or models:[...] for multi-part trains, line_id?}; "
         "vehicle_set_line {vehicle_id, line_id, stop_index?}; vehicle_sell {vehicle_id}; "
         "vehicle_to_depot {vehicle_id, sell_on_arrival?}; vehicle_stop {vehicle_id}; vehicle_start {vehicle_id}; "
         "build_construction {file (e.g. '::/depots/road/road_depot/road_depot.con'), position:[x,y,z], "
-        "rotation?:radians, params?:{...}, name?} — run with dry_run first, it reports errors and costs; "
+        "rotation?:radians, params?:{...}, name?} — run with dry_run first, it reports errors and costs; the "
+        "result lists depot_ids/station_ids inside the new construction; "
         "bulldoze {entity_id of a construction}; save_game {name}."
     ),
     "parameters": {

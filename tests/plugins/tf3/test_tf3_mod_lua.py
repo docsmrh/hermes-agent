@@ -91,7 +91,10 @@ def test_hello_and_snapshot(channel, game):
     line = snap["lines"]["items"][0]
     assert line["name"] == "Bus 1" and line["vehicle_count"] == 2
     assert [s["station_group_id"] for s in line["stops"]] == [300, 301]  # read through a native vector
-    assert line["load"]["ratio"] == 0.75
+    assert line["load"]["ratio"] == 0.75  # read from a per-cargo map
+    assert line["transport_modes"] == ["BUS"]  # enum value mapped back to its name
+    vehicle = next(v for v in snap["vehicles"]["items"] if v["id"] == 500)
+    assert (vehicle["state"], vehicle["carrier"]) == ("EN_ROUTE", "ROAD")
     station = next(s for s in snap["stations"]["items"] if s["id"] == 200)
     assert station["index_in_group"] == 0 and station["position"] == [100, 200, 5]
     assert snap["depots"]["items"][0]["id"] == 400
@@ -107,6 +110,15 @@ def test_unknown_entity_is_never_read(channel, game):
         call(channel, "vehicle_sell", {"vehicle_id": 424242})
     assert exc.value.code == "not_found"
     assert game.G.fatal_reads == 0  # would have crashed the real game
+
+
+def test_vehicle_models_report_availability(channel):
+    res = call(channel, "list_vehicle_models", {"contains": "vehicle/"})["result"]
+    by_file = {m["file"]: m for m in res["models"]}
+    assert by_file["vehicle/bus/old_bus.mdl"]["available"] is True and res["year"] == 1905
+    assert by_file["vehicle/tram/old_tram.mdl"]["available"] is False  # not invented until 1950
+    only = call(channel, "list_vehicle_models", {"available_only": True})["result"]["models"]
+    assert [m["file"] for m in only] == ["vehicle/bus/old_bus.mdl"]
 
 
 def test_selftest_reports_api_surface(channel):
@@ -165,7 +177,12 @@ def test_build_and_bulldoze(channel, game):
     res = call(channel, "build_construction", {"file": "::/depots/road/road_depot/road_depot.con",
                                                "position": [5, 6, 0], "rotation": 1.5708,
                                                "params": {"modules": {}}})["result"]
-    assert res["accepted"] and res["entity_ids"]
+    assert res["accepted"] and res["entity_ids"] and res["depot_ids"]
+    # The new depot is usable straight away, by depot id or by construction id.
+    for depot_ref in (res["depot_ids"][0], res["entity_ids"][0]):
+        bought = call(channel, "vehicle_buy", {"depot_id": depot_ref, "model": "vehicle/bus/old_bus.mdl"})["result"]
+        assert bought["vehicle_id"]
+        assert game.find_logged("vehicle_buy").depot == res["depot_ids"][0]
     proposal = game.find_logged("proposal")
     ce = proposal.proposal.constructionsToAdd[1]
     assert ce.fileName.endswith("road_depot.con") and ce.params.year == 1905 and ce.params.seed == 0

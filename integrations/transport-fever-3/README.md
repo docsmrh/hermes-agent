@@ -91,7 +91,7 @@ It looks for the userdata folder automatically. If it finds none, or more than o
 
 ### 3. In the game
 
-Enable **Hermes Bridge** in the mod list when you start or load a game; mods are enabled per savegame. Then, on the VPS:
+Restart Transport Fever 3 after installing or updating the mod; the game only picks up new mod files on a full restart. Then enable **Hermes Bridge** in the mod list when you start or load a game; mods are enabled per savegame. Then, on the VPS:
 
 ```bash
 hermes tf3 status          # relay, tunnel and mod heartbeat
@@ -151,7 +151,7 @@ hermes cron pause tf3-autopilot   # stop the loop
 
 ## Verification
 
-**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 79 tests.
+**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 80 tests.
 - The real mod Lua runs under Lua 5.2 (`lupa`, optional; those tests are skipped without it). It runs against `tests/plugins/tf3/fake_game.lua`, a stand-in for the TF3 script runtime with real userdata files and a crash-strict `getComponent`.
 - The real relay and the real plugin run unchanged.
 - The end-to-end tests drive Hermes tools → HTTP → relay → files → mod → simulated engine and back.

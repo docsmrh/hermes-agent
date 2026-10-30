@@ -96,7 +96,7 @@ api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "hermes_bridge", "herm
 | `hello`, `ping` | read | — | version / pong |
 | `snapshot` | read | `sections` (`game`, `finance`, `lines`, `vehicles`, `stations`, `depots`, `towns`, `industries`, `problems`), `limit` 1-200 | One object per section |
 | `get_entity` | read | `id` | `{exists, name, components, position?}` (never reads a dead entity) |
-| `list_vehicle_models` | read | `contains?`, `metadata?`, `limit?` | `{models:[{file,id}], total}` |
+| `list_vehicle_models` | read | `contains?`, `available_only?`, `metadata?`, `limit?` | `{models:[{file, id, year_from?, year_to?, price?, available?}], total, year}` |
 | `selftest` | read | — | `{available, missing, line_stop_index_base}` |
 | `camera_focus` | view | `entity_id` or `position:[x,y,z]` + `distance?` | `{focused}` |
 | `take_screenshot` | view | `scale?` | `{requested}` (used by `/v1/screenshot`) |
@@ -104,14 +104,16 @@ api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "hermes_bridge", "herm
 | `line_create` | action | `name`, `stops:[station_id \| {station_id, terminal?} \| {station_group_id, station_index}]`, `color?` | `{accepted, line_id}` |
 | `line_update` | action | `line_id`, `stops?`, `name?` | `{accepted}` |
 | `line_delete` | destructive | `line_id` | `{accepted}` |
-| `vehicle_buy` | spend | `depot_id`, `model` (file or id) or `models:[...]`, `line_id?` | `{accepted, vehicle_id, line_assigned?}` |
+| `vehicle_buy` | spend | `depot_id` (a depot, or a construction that contains one), `model` (file or id) or `models:[...]`, `line_id?` | `{accepted, vehicle_id, line_assigned?}` |
 | `vehicle_set_line` | action | `vehicle_id`, `line_id`, `stop_index?` | `{accepted}` |
 | `vehicle_sell` | destructive | `vehicle_id` | `{accepted}` |
 | `vehicle_to_depot` | action | `vehicle_id`, `sell_on_arrival?` | `{accepted}` |
 | `vehicle_stop`, `vehicle_start` | action | `vehicle_id` | `{accepted}` |
-| `build_construction` | spend | `file`, `position`, `rotation?`, `params?`, `name?`, `ignore_errors?` | `{accepted, entity_ids}`; with `dry_run`, `{valid, errors, costs}` |
+| `build_construction` | spend | `file`, `position`, `rotation?`, `params?`, `name?`, `ignore_errors?` | `{accepted, entity_ids, depot_ids, station_ids}`; with `dry_run`, `{valid, errors, costs}` |
 | `bulldoze` | destructive | `entity_id` (a construction) | `{accepted, entity_ids}` |
 | `save_game` | save | `name` (`[A-Za-z0-9 _-]`, ≤64) | `{saved}` |
 | `lua_eval` | lua | `code` | `{value, printed}` |
 
 Every action op accepts `dry_run: true`. The mod then validates the arguments and builds the command without sending it; proposals are priced through `makeProposalData`.
+
+Native engine lists are read as `v:at(1..v:size())` and are never iterated with `ipairs` or `pairs`, which can hang the game. Engine maps, such as per-cargo line usage, are read with `pairs`. Enum values are mapped back to names by indexing known member names into `api.type.enum.<Type>`.

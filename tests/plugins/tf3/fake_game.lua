@@ -51,12 +51,12 @@ for e, n in pairs({ [LINE] = 'Bus 1', [ST_A] = 'Alpha Station', [ST_B] = 'Beta S
                     [VEH_1] = 'Bus #1', [VEH_2] = 'Bus #2', [TOWN] = 'Alpha', [IND] = 'Coal Mine' }) do
   set(e, 'NAME', { name = n })
 end
--- LINE.stops is a native vector (userdata with :size()/:at()) to exercise
--- the mod's vector handling; everything else is plain tables.
+-- LINE.stops is a native vector (userdata with :size()/:at(1..n)) to
+-- exercise the mod's vector handling; everything else is plain tables.
 set(LINE, 'LINE', {
   stops = make_vector({ { stationGroup = GROUP_A, station = 0, terminal = 0 },
                         { stationGroup = GROUP_B, station = 0, terminal = 0 } }),
-  vehicleInfo = { transportModes = { BUS = true } },
+  vehicleInfo = { transportModes = { [3] = true } },  -- keyed by TransportMode enum values (3 = BUS)
 })
 owned(LINE)
 set(ST_A, 'STATION', { terminals = {} }); owned(ST_A)
@@ -109,7 +109,8 @@ G.engine_state_ro = { get = function(self) return G.engine_state:get() end }
 local api = { type = {}, engine = { util = {}, system = {} }, cmd = {}, res = {}, gui = { camera = {}, game = {} }, util = {} }
 api.type.ComponentType = CT
 api.type.enum = { TransportVehicleState = { IN_DEPOT = 0, EN_ROUTE = 1, AT_TERMINAL = 2, GOING_TO_DEPOT = 3 },
-                  Carrier = { ROAD = 0, RAIL = 1, TRAM = 2, OTHER = 3, AIR = 4, WATER = 5 } }
+                  Carrier = { ROAD = 0, RAIL = 1, TRAM = 2, OTHER = 3, AIR = 4, WATER = 5 },
+                  TransportMode = { PERSON = 0, CARGO = 1, CAR = 2, BUS = 3, TRUCK = 4, TRAM = 5 } }
 
 -- The real engine aborts the whole game (not a Lua error) when asked for a
 -- component of an entity that does not exist; count such reads so tests can
@@ -160,13 +161,14 @@ eu.vehicle = {
   getRunningCost = function(v) return 15000 end,
   getDepreciatedValue = function(v) return 40000 end,
 }
-eu.line = { getLineCapacityUsages = function(l, flag) return { { used = 30, capacity = 40 } } end }
+-- A map keyed by cargo type, as in the game (not a list).
+eu.line = { getLineCapacityUsages = function(l, flag) return { PASSENGERS = { used = 30, capacity = 40 } } end }
 eu.town = { getTownCapacityUsage = function(t) return { { used = 900, capacity = 1000 }, { used = 50, capacity = 80 } } end }
 eu.stock = { getCargoShippedPerYear = function(s) return 1200 end, getProductionRating = function(s) return 0.8 end }
 eu.proposal = {
   makeProposalData = function(p, ctx) return { errorState = { critical = false, messages = {} }, costs = 75000 } end,
 }
-eu.calculateStationUsage = function(st) return { totalUsed = 12, poolCapacity = 50 } end
+eu.station = { calculateStationUsage = function(st) return { totalUsed = 12, poolCapacity = 50 } end }
 
 local sys = api.engine.system
 sys.lineSystem = {
@@ -215,8 +217,13 @@ api.type.SimpleProposal = {
 api.type.Context = { new = function() return {} end }
 
 local MODELS = { ['vehicle/bus/old_bus.mdl'] = 77, ['vehicle/tram/old_tram.mdl'] = 78 }
+local MODEL_YEARS = { [77] = { 1880, 1930 }, [78] = { 1950, 0 } }
 api.res.modelRep = {
   find = function(name) return MODELS[name] or -1 end,
+  get = function(id)
+    local y = MODEL_YEARS[id]
+    return { metadata = { availability = { yearFrom = y[1], yearTo = y[2] }, cost = { price = 60000 } } }
+  end,
   forEachModelWithMetadata = function(meta, fn)
     for _, n in ipairs({ 'vehicle/bus/old_bus.mdl', 'vehicle/tram/old_tram.mdl' }) do fn(n) end
   end,
@@ -278,8 +285,21 @@ local function execute(c, cb)
     set(next_entity, 'TRANSPORT_VEHICLE', { depot = c.depot, state = 0 }); owned(next_entity)
   end
   if c.kind == 'proposal' then
-    next_entity = next_entity + 1
-    ents = { { next_entity, 0 } }
+    for _, ce in ipairs(c.proposal.constructionsToAdd or {}) do
+      next_entity = next_entity + 2
+      local con, depot = next_entity - 1, next_entity
+      local depots = {}
+      if tostring(ce.fileName):find('depot', 1, true) then
+        set(depot, 'VEHICLE_DEPOT', {}); owned(depot)
+        depots = { depot }
+      end
+      set(con, 'CONSTRUCTION', { fileName = ce.fileName, transf = ce.transf, depots = depots, stations = {} })
+      ents[#ents + 1] = { con, 0 }
+    end
+    if #ents == 0 then
+      next_entity = next_entity + 1
+      ents = { { next_entity, 0 } }
+    end
   end
   if cb then cb(c, true, ents) end
 end
