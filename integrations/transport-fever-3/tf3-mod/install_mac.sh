@@ -215,45 +215,42 @@ agent_load "$AGENTS_DIR/$LABEL_RELAY.plist"
 PUBKEY="$( [ -f "$KEY.pub" ] && cat "$KEY.pub" || echo "ssh-ed25519 AAAA...(generated on install) hermes-tf3-tunnel")"
 TUNNEL_USER="${VPS%%@*}"
 [ "$TUNNEL_USER" = "$VPS" ] && TUNNEL_USER="<tunnel-user>"
+VPS_HOST="${VPS#*@}"
+PLUGIN_DIR="$(cd "$HERE/.." && pwd)/hermes-plugin"
 cat <<EOF
 
-Done on the Mac. Finish on the VPS. Use a dedicated low-privilege account for
-the tunnel (e.g. 'sudo useradd -m -s /usr/sbin/nologin $TUNNEL_USER'), never one
-you or Hermes log in with: step 2 turns off shell logins for '$TUNNEL_USER'.
+Done on the Mac. Finish on the VPS with install_vps.sh, run by an account that
+can sudo there (<you> below). It gives the tunnel its own account,
+'$TUNNEL_USER', with no shell and no password. Never pick an account you or
+Hermes log in with: shell logins are turned off for it.
 
-  1. Append this single line to that account's ~/.ssh/authorized_keys:
+  1. Copy the VPS installer, the tf3 plugin and this Mac's tunnel key over:
+
+     ssh <you>@$VPS_HOST 'mkdir -p hermes-tf3'
+     scp -r "$PLUGIN_DIR" "$KEY.pub" <you>@$VPS_HOST:hermes-tf3/
+
+  2. Run it on the VPS (add --dry-run first to preview, and --hermes-user NAME
+     if Hermes runs under another account). It asks for the shared token,
+     which you print on this Mac with:  $PYTHON "$SUPPORT_DIR/tf3_relay.py" token
+
+     ssh -t <you>@$VPS_HOST sudo bash hermes-tf3/hermes-plugin/install_vps.sh \\
+         --pubkey-file hermes-tf3/hermes_tf3_tunnel.pub --tunnel-user $TUNNEL_USER --port $PORT
+
+     It locks '$TUNNEL_USER' down with an sshd Match block (checked with sshd -t
+     and sshd -T, with a backup) and installs this line for the key:
 
      restrict,port-forwarding,permitlisten="127.0.0.1:$PORT",permitopen="127.0.0.1:1",command="/bin/false" $PUBKEY
 
-  2. As root, add this block at the END of /etc/ssh/sshd_config and reload sshd
-     (sshd -t && systemctl reload sshd). The key options alone still allow
-     unix-socket forwards; this block limits the account to the one tunnel:
-
-     Match User $TUNNEL_USER
-         AllowStreamLocalForwarding no
-         AllowTcpForwarding remote
-         PermitListen 127.0.0.1:$PORT
-         PermitOpen none
-         AllowAgentForwarding no
-         X11Forwarding no
-         PermitTTY no
-         ForceCommand /bin/false
-
-  3. Put the shared token in the Hermes .env on the VPS (print it on the Mac
-     with: $PYTHON "$SUPPORT_DIR/tf3_relay.py" token). It is an HMAC key: it is
-     never sent over the tunnel.
-
-     TF3_BRIDGE_TOKEN=<token>
-
-  4. Trust the VPS host key once from this Mac (the tunnel uses
+  3. Trust the VPS host key once from this Mac (the tunnel uses
      StrictHostKeyChecking=yes):   ssh -i "$KEY" -o IdentitiesOnly=yes $VPS true
      (it exits with an error from /bin/false after accepting the key; that is expected)
 
-  5. Start the tunnel:
+  4. Start the tunnel:
      launchctl bootstrap gui/\$(id -u) "$AGENTS_DIR/$LABEL_TUNNEL.plist"
 
-  6. Restart Transport Fever 3, enable "Hermes Bridge" in the mod list when you
-     start or load a game, then on the VPS run:  hermes tf3 status
+  5. Restart Hermes on the VPS (hermes gateway restart), restart Transport
+     Fever 3, enable "Hermes Bridge" in the mod list when you start or load a
+     game, then on the VPS run:  hermes tf3 status
 
 Kill switch on the Mac at any time:  $PYTHON "$SUPPORT_DIR/tf3_relay.py" pause
 EOF

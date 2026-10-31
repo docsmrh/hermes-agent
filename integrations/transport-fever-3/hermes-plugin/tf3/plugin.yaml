@@ -9,7 +9,7 @@ platforms:
   - macos
 requires_env:
   - name: TF3_BRIDGE_TOKEN
-    description: "Bearer token printed by `tf3_relay.py init` on the Mac running Transport Fever 3"
+    description: "Shared HMAC key (never sent); print it on the Mac with `tf3_relay.py token`"
     secret: true
 provides_tools:
   - tf3_observe

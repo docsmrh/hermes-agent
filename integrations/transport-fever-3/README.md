@@ -21,6 +21,7 @@ This is a Transport Fever 3 mod that lets a Hermes agent running on a VPS observ
 | Relay (stdlib Python 3.9+, about 1 kLOC, no game logic) | `tf3-mod/relay/tf3_relay.py` | Mac, as a LaunchAgent |
 | Mac installer (LaunchAgents and the tunnel key) | `tf3-mod/install_mac.sh` | Mac |
 | Hermes plugin (tools, guardrails, CLI, autopilot skill) | `hermes-plugin/tf3/` | VPS |
+| VPS installer (tunnel account, sshd lockdown, plugin, token) | `hermes-plugin/install_vps.sh` | VPS |
 | Wire contract | `PROTOCOL.md` | — |
 
 **Why there is a relay.**
@@ -69,13 +70,23 @@ It looks for the userdata folder automatically. If it finds none, or more than o
 
 ### 2. VPS
 
-1. Use a dedicated low-privilege account for the tunnel. Add the line the installer printed to that account's `~/.ssh/authorized_keys`:
+`hermes-plugin/install_vps.sh` does the VPS side in one command. Run it as an account that can `sudo`. The tunnel gets its own account (`tunnel` by default), created with no shell and no password. Never use an account you or Hermes log in with: the `Match` block turns off shell logins for it, and the script refuses root, the Hermes account, and any existing account that has a login shell.
 
-   ```
-   restrict,port-forwarding,permitlisten="127.0.0.1:47800",permitopen="127.0.0.1:1",command="/bin/false" ssh-ed25519 AAAA… hermes-tf3-tunnel
-   ```
+```bash
+# On the Mac: copy the installer, the plugin and the tunnel key to the VPS.
+ssh you@your-vps.example.com 'mkdir -p hermes-tf3'
+scp -r hermes-agent/integrations/transport-fever-3/hermes-plugin ~/.ssh/hermes_tf3_tunnel.pub you@your-vps.example.com:hermes-tf3/
 
-2. As root, add the `Match User` block the installer printed to the end of `/etc/ssh/sshd_config`, then run `sshd -t && systemctl reload sshd`:
+# On the VPS. It asks for the token: print it on the Mac with tf3_relay.py token.
+sudo bash hermes-tf3/hermes-plugin/install_vps.sh --pubkey-file hermes-tf3/hermes_tf3_tunnel.pub --dry-run   # preview
+sudo bash hermes-tf3/hermes-plugin/install_vps.sh --pubkey-file hermes-tf3/hermes_tf3_tunnel.pub
+hermes gateway restart
+```
+
+Add `--hermes-user NAME` if Hermes runs under an account other than the one that ran `sudo`, and `--port` if you changed it on the Mac. The script:
+
+1. creates the tunnel account;
+2. appends this marked block to `/etc/ssh/sshd_config`, after a backup. It checks the result with `sshd -t` and the tunnel account's effective policy with `sshd -T`, then reloads sshd. If any step fails, sshd keeps the old configuration. The closing `Match all` keeps settings appended to the file later from applying only to the tunnel account:
 
    ```
    Match User tunnel
@@ -87,21 +98,21 @@ It looks for the userdata folder automatically. If it finds none, or more than o
        X11Forwarding no
        PermitTTY no
        ForceCommand /bin/false
+   Match all
    ```
 
-   Both parts were tested against OpenSSH 9.9 `sshd`. Together they allow only the reverse tunnel onto `127.0.0.1:47800`: other ports, wildcard binds, local forwards, unix-socket forwards and shells are refused. The key line alone does **not** stop unix-socket forwards, so the `Match` block is required.
+3. adds the Mac's key to the tunnel account's `~/.ssh/authorized_keys`, after the block is in place:
 
-3. Install and enable the plugin:
-
-   ```bash
-   ln -s /path/to/hermes-agent/integrations/transport-fever-3/hermes-plugin/tf3 ~/.hermes/plugins/tf3
-   # or: hermes plugins install docsmrh/hermes-agent/integrations/transport-fever-3/hermes-plugin/tf3 --ref <commit-sha>
-   hermes plugins enable tf3
+   ```
+   restrict,port-forwarding,permitlisten="127.0.0.1:47800",permitopen="127.0.0.1:1",command="/bin/false" ssh-ed25519 AAAA… hermes-tf3-tunnel
    ```
 
-4. Put the token in the Hermes `.env`: `TF3_BRIDGE_TOKEN=<value of "tf3_relay.py token" on the Mac>`. It is used as an HMAC key and never sent over the tunnel.
+4. copies the plugin into `~/.hermes/plugins/tf3` and runs `hermes plugins enable tf3`;
+5. stores `TF3_BRIDGE_TOKEN` in `~/.hermes/.env` (mode 0600). It reads the token from a hidden prompt or `--token-file`, never from the command line. The token is an HMAC key and is never sent over the tunnel.
 
-5. On the Mac, accept the VPS host key once, then start the tunnel. The installer prints both commands.
+The key line and the block together were tested against OpenSSH 9.9 `sshd`. They allow only the reverse tunnel onto `127.0.0.1:47800`: other ports, wildcard binds, local forwards, unix-socket forwards and shells are refused. The key line alone does **not** stop unix-socket forwards, so the `Match` block is required. `--uninstall` reverses steps 2–5 and leaves the account (`sudo userdel -r tunnel` removes it).
+
+Then, on the Mac, accept the VPS host key once and start the tunnel. The Mac installer prints both commands.
 
 ### 3. In the game
 
@@ -181,11 +192,19 @@ hermes cron pause tf3-autopilot   # stop the loop
 
 ## Verification
 
-**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 145 tests.
+**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 158 tests.
 - The real mod Lua runs under Lua 5.2 (`lupa`, optional; those tests are skipped without it). It runs against `tests/plugins/tf3/fake_game.lua`, a stand-in for the TF3 script runtime with real userdata files and a crash-strict `getComponent`.
 - The real relay and the real plugin run unchanged.
 - The end-to-end tests drive Hermes tools → HTTP → relay → files → mod → simulated engine and back.
 - The plugin is also loaded through the real `PluginManager`.
+- `install_vps.sh` is checked against a real OpenSSH 9.9 `sshd` in test mode (`sshd -t` and `sshd -T`) on throwaway configs. The tests cover:
+  - the lockdown the tunnel account actually gets, and that nobody else is affected;
+  - re-installing and uninstalling;
+  - refusing a config in which an earlier `Match` block would win;
+  - the key line matching `install_mac.sh`;
+  - the token file stays private.
+  
+  Its root-only steps (`useradd`, `runuser`, reloading sshd) only run on a real VPS. Preview them there with `--dry-run`.
 
 **Not verifiable without the game.**
 - Live TF3 behaviour is untested. The API calls follow the official script reference and the working community mods listed below.
