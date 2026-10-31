@@ -1,0 +1,8 @@
+{
+	"modId": "hermes_bridge",
+	"revision": 1,
+	"severityAdd": "None",
+	"severityRemove": "Warning",
+	"visible": true,
+	"cosmetic": false
+}

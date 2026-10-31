@@ -1,0 +1,8 @@
+{
+	"name": "Hermes Bridge",
+	"summary": "Lets a Hermes AI agent observe and play your company through a local relay.",
+	"description": "Exchanges requests and results with the tf3_relay.py companion through the mod_presets userdata folder. Reads game state, runs line, vehicle and construction commands, and moves the camera for screenshots. Nothing happens unless the relay is installed and running.",
+	"authors": [ { "name": "docsmrh", "role": "CREATOR" } ],
+	"tags": [ "Script Mod" ],
+	"url": ""
+}

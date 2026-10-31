@@ -1,0 +1,12 @@
+{
+	"archives": null,
+	"files": [
+		"hermes_bridge/bridge.lua",
+		"hermes_bridge/hermes_bridge.gs.lua",
+		"hermes_bridge/hermes_bridge.script.lua",
+		"hermes_bridge/json.lua",
+		"hermes_bridge/ops.lua",
+		"hermes_bridge/snapshot.lua",
+		"hermes_bridge/util.lua"
+	]
+}
