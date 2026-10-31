@@ -213,6 +213,14 @@ def _drop_nulls(value: Any) -> Any:
     return value
 
 
+def _wants_dry_run(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "no", "off"}
+    return bool(value)
+
+
 def _call_state_change(client: BridgeClient, op: str, args: dict) -> Tuple[str, dict]:
     """Run a state-changing op; after a timeout ask again with the *same*
     request id, which returns the late result instead of queueing it twice.
@@ -482,9 +490,9 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     params = _drop_nulls(params)
-    # A dry run asked for anywhere stays a dry run; never let one side
-    # silently turn the other into a real action.
-    dry_run = args.get("dry_run") is True or params.pop("dry_run", None) is True
+    # A dry run asked for anywhere, in any spelling ("true", 1, ...), stays a
+    # dry run: when in doubt, do not touch the game.
+    dry_run = _wants_dry_run(args.get("dry_run")) or _wants_dry_run(params.pop("dry_run", None))
     reason = str(args.get("reason") or "").strip()[:500]
     settings = _settings()
     action_class = check_action(action, settings, params)

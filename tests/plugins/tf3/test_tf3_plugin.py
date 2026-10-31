@@ -254,6 +254,22 @@ def test_dry_run_inside_params_is_honoured(wired):
     assert not ctx.state.get("action_log")  # nothing happened, nothing logged
 
 
+@pytest.mark.parametrize("flag", [True, "true", "True", 1, "yes"])
+def test_any_dry_run_spelling_is_a_dry_run(wired, flag):
+    plugin, ctx, relay = wired
+    out = run(plugin, "tf3_act", {"action": "vehicle_sell", "params": {"vehicle_id": 1, "dry_run": flag},
+                                  "reason": "x"})
+    assert out["dry_run"] is True and relay.calls[-1][1]["dry_run"] is True
+    assert not ctx.state.get("action_log")
+
+
+def test_explicit_false_dry_run_is_a_real_action(wired):
+    plugin, ctx, relay = wired
+    out = run(plugin, "tf3_act", {"action": "vehicle_stop", "params": {"vehicle_id": 1, "dry_run": "false"},
+                                  "reason": "x"})
+    assert out["dry_run"] is False and relay.calls[-1][1]["dry_run"] is False
+
+
 def test_null_params_are_dropped(wired):
     plugin, ctx, relay = wired
     run(plugin, "tf3_act", {"action": "line_update", "params": {"line_id": 5, "name": None,

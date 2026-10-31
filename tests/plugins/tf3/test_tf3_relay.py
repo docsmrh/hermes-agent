@@ -285,6 +285,19 @@ def test_rejects_bad_request_ids(tmp_path):
         assert exc.value.code == "invalid_request"
 
 
+def test_dry_run_must_be_a_boolean(tmp_path):
+    channel = StubChannel()
+    relay = make_relay(tmp_path, channel)
+    for bad in ["true", "false", 1, 0, {}]:
+        with pytest.raises(R.RelayError) as exc:
+            relay.call({"op": "vehicle_sell", "args": {"vehicle_id": 1, "dry_run": bad}})
+        assert exc.value.code == "invalid_request"
+    assert channel.calls == []  # nothing reached the mod
+    for ok in [True, False, None]:
+        relay.call({"op": "vehicle_sell", "args": {"vehicle_id": 1, "dry_run": ok}})
+    assert channel.calls == ["vehicle_sell"] * 3
+
+
 def test_mod_errors_map_to_422(tmp_path):
     class Failing(StubChannel):
         def call(self, *a):

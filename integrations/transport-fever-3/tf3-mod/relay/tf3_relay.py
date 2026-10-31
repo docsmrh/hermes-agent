@@ -1078,6 +1078,10 @@ class Relay:
             raise RelayError(400, "invalid_request", "request_id must be 1-64 chars of [A-Za-z0-9_-]")
         if len(json.dumps(args, ensure_ascii=True, separators=(",", ":"))) > MAX_ARGS_BYTES:
             raise RelayError(413, "args_too_large", f"args must serialize to at most {MAX_ARGS_BYTES} bytes")
+        # The mod runs an action for real unless dry_run is exactly true, so a
+        # "true" string would act. Refuse anything that is not a boolean.
+        if args.get("dry_run") is not None and not isinstance(args["dry_run"], bool):
+            raise RelayError(400, "invalid_request", "args.dry_run must be a boolean")
         try:
             timeout_s = float(body.get("timeout_s") or 30)
         except (TypeError, ValueError):

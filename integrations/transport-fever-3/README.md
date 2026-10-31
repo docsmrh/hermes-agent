@@ -181,7 +181,7 @@ hermes cron pause tf3-autopilot   # stop the loop
 
 ## Verification
 
-**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 120 tests.
+**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 127 tests.
 - The real mod Lua runs under Lua 5.2 (`lupa`, optional; those tests are skipped without it). It runs against `tests/plugins/tf3/fake_game.lua`, a stand-in for the TF3 script runtime with real userdata files and a crash-strict `getComponent`.
 - The real relay and the real plugin run unchanged.
 - The end-to-end tests drive Hermes tools → HTTP → relay → files → mod → simulated engine and back.

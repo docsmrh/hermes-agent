@@ -43,7 +43,7 @@ Every non-2xx JSON response, and a 2xx with `ok: false`, has this shape:
 
 | HTTP | code | Meaning |
 |---|---|---|
-| 400 | `invalid_request`, `unknown_op` | Malformed body (including NaN/Infinity, or nesting deeper than 32 levels), or an op that is not on the relay allowlist |
+| 400 | `invalid_request`, `unknown_op` | Malformed body (including NaN/Infinity, nesting deeper than 32 levels, or a non-boolean `args.dry_run`), or an op that is not on the relay allowlist |
 | 401 | `unauthorized`, `stale_request`, `replayed_request` | Request signature failed (see Authentication) |
 | 403 | `paused`, `policy_denied` | Mac kill switch, or a policy flag in the Mac config |
 | 413 | `body_too_large`, `args_too_large` | The body is larger than 256 KiB, or one request's args serialize to more than 32 KiB |
@@ -157,7 +157,7 @@ api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "hermes_bridge", "herm
 | `save_game` | save | `name` (`[A-Za-z0-9_-]`, ≤48; saved as `hermes-<name>`) | `{saved}` |
 | `lua_eval` | lua | `code` | `{value, printed}` |
 
-- **Dry runs.** Every action op accepts `dry_run: true`. The mod then validates the arguments and builds the command without sending it; proposals are priced through `makeProposalData`, vehicles from their model metadata.
+- **Dry runs.** Every action op accepts `dry_run: true`; the plugin treats any value other than an explicit false (`false`, `"false"`, `0`, `"no"`, `"off"`, empty) as a dry run, top level or inside `params`, and the relay refuses a non-boolean `dry_run` from any other client. The mod then validates the arguments and builds the command without sending it; proposals are priced through `makeProposalData`, vehicles from their model metadata.
 - **Validation.** Stops are checked against live entities: the group exists, `station_index` and `terminal` are in range, and `stop_index` falls within the line. Stale indices are a reported native crash in the game's line code.
 - **Native engine lists** are read as `v:at(1..v:size())` and are never iterated with `ipairs` or `pairs`, which can hang the game.
 - **Engine maps**, such as per-cargo line usage, are read with `pairs`.
