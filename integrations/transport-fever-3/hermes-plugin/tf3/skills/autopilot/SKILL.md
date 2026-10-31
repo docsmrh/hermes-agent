@@ -48,16 +48,17 @@ skill and follow the Procedure once per user request.
 | `tf3_lua` | Only if enabled and `tf3_act` lacks a command; keep chunks small |
 
 Budget per turn: `max_actions_per_session` (shown in `tf3_observe` →
-`guardrails`). A cron turn also has a hard time cap of a few minutes, so plan
-for 3–8 actions, not 30.
+`guardrails`; it counts the whole run, delegated subagents included). A cron
+turn also has a hard time cap of a few minutes, so plan for 3–8 actions, not 30.
 
 ## Procedure
 
 1. **Orient.** `tf3_journal action=read`. Note the plan, the last entries, and
    any failed actions in `recent_actions`.
 2. **Observe.** `tf3_observe` with `sections=["game","finance","lines","problems"]`.
-   If the bridge reports the mod is not connected or the game is paused in a
-   menu, append a journal entry saying so and stop — do not retry in a loop.
+   If the bridge reports the mod is not connected, or `game.paused` is true
+   (the player paused it), append a journal entry saying so and stop. Do not
+   unpause a game the player paused, and do not retry in a loop.
 3. **Triage problems first** (cheapest wins):
    - Lines flagged in `problems` (no path, unconnected stops) — fix or delete.
    - Vehicles stuck or without a path — send to depot or re-assign.
@@ -80,14 +81,16 @@ for 3–8 actions, not 30.
 
 ## Pitfalls
 
-- While the game is paused, actions fail with `game_paused` and nothing is
-  done: `set_speed {speedup: 1}` first. An action that fails with
-  `outcome: unknown` (a timeout) may still happen — re-observe before retrying.
+- While the game is paused, actions fail with `game_paused` (or
+  `player_paused` for `set_speed`) and nothing is done: the player paused it,
+  so end the turn. An action that fails with `outcome: unknown` may still have
+  happened — re-observe before retrying; `outcome: not_done` means it did not.
 - Entity ids are stable only within one loaded save. After the user loads a
   different save, the journal's ids are stale; re-observe before acting.
 - Do not bulldoze or sell to "clean up" without evidence from `tf3_observe`
   that the asset loses money or is broken.
-- `save_game` overwrites by name; use a dedicated name like `hermes-autosave`.
+- `save_game` always saves as `hermes-<name>`, so it can never overwrite the
+  player's own saves; reuse one name (e.g. `autosave`) to avoid clutter.
 - If an action fails with `paused`, `policy_denied` or `readonly`, the user has
   stopped automation on purpose. Journal it and end the turn.
 

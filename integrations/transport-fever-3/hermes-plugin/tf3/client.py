@@ -2,20 +2,31 @@
 
 The relay listens on the Mac's loopback interface and is reached from the
 VPS through an SSH reverse tunnel, so from Hermes' point of view it is a
-plain ``http://127.0.0.1:<port>`` endpoint. The bearer token never leaves
-the machine pair: the client refuses to send it to a non-loopback host
-unless the URL is https and the user explicitly allowed a remote bridge.
+plain ``http://127.0.0.1:<port>`` endpoint.
+
+Authentication never puts the shared token on the wire: every request
+carries an HMAC-SHA256 signature over method, path, timestamp, nonce and
+body, and every response must carry the relay's signature over the same
+nonce. Anything else listening on the port (the tunnel is down and another
+local user grabbed it) therefore learns nothing reusable and is detected
+instead of trusted. Proxy environment variables are ignored: the relay is
+always reached directly.
 
 Wire contract: ``integrations/transport-fever-3/PROTOCOL.md`` (section A).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
+import json
+import secrets
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -47,6 +58,22 @@ class BridgeError(Exception):
         return out
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def request_signature(key: str, method: str, target: str, timestamp: str, nonce: str, body: bytes) -> str:
+    """Must match tf3_relay.request_signature byte for byte."""
+    canonical = "\n".join(["tf3-v1", method.upper(), target, timestamp, nonce, _sha256_hex(body)])
+    return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def response_signature(key: str, nonce: str, status: int, body: bytes) -> str:
+    """Must match tf3_relay.response_signature byte for byte."""
+    canonical = "\n".join(["tf3-v1-resp", nonce, str(int(status)), _sha256_hex(body)])
+    return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _is_loopback_host(host: str) -> bool:
     if host in {"localhost", "localhost."}:
         return True
@@ -61,14 +88,16 @@ def validate_bridge_url(url: str, *, allow_remote: bool = False) -> str:
 
     Loopback http(s) is always allowed (the SSH tunnel provides transport
     security). A non-loopback host is allowed only over https and only when
-    ``allow_remote`` is set, so a typo or a poisoned config cannot ship the
-    bearer token to an arbitrary host in cleartext.
+    ``allow_remote`` is set, so a typo or a poisoned config cannot point the
+    agent's game control at an arbitrary host.
     """
     parts = urlsplit((url or "").strip())
     if parts.scheme not in {"http", "https"} or not parts.hostname:
         raise ValueError(f"bridge_url must be an http(s) URL with a host, got {url!r}")
     if parts.username or parts.password:
         raise ValueError("bridge_url must not embed credentials")
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError("bridge_url must be just scheme://host:port")
     if not _is_loopback_host(parts.hostname):
         if not allow_remote:
             raise ValueError(
@@ -104,16 +133,48 @@ class BridgeClient:
 
     # -- low level ---------------------------------------------------------
 
+    def _signed_headers(self, method: str, target: str, body: bytes) -> tuple:
+        timestamp = str(int(time.time()))
+        nonce = secrets.token_hex(16)
+        headers = {
+            "X-TF3-Protocol": str(PROTOCOL_VERSION),
+            "X-TF3-Timestamp": timestamp,
+            "X-TF3-Nonce": nonce,
+            "X-TF3-Signature": request_signature(self._token, method, target, timestamp, nonce, body),
+        }
+        if body:
+            headers["Content-Type"] = "application/json"
+        return headers, nonce
+
+    def _verify_response(self, resp: httpx.Response, nonce: str) -> None:
+        presented = resp.headers.get("X-TF3-Response-Signature", "")
+        expected = response_signature(self._token, nonce, resp.status_code, resp.content)
+        if not presented or not hmac.compare_digest(presented.lower().encode("ascii", "replace"),
+                                                    expected.encode("ascii")):
+            raise BridgeError(
+                "relay_unauthenticated",
+                f"the service at {self.base_url} did not prove it is the TF3 relay (bad or missing response "
+                "signature). Either TF3_BRIDGE_TOKEN differs from the Mac's token, or something else is "
+                "listening on that port while the SSH tunnel is down.",
+                retryable=False,
+                status=resp.status_code,
+            )
+
     def _request(self, method: str, path: str, *, json_body: Any = None, params: Optional[dict] = None,
                  timeout_s: Optional[float] = None, retry_connect: bool = True) -> httpx.Response:
         timeout = self.timeout_s if timeout_s is None else max(1.0, min(float(timeout_s), _MAX_TIMEOUT_S))
-        headers = {"Authorization": f"Bearer {self._token}", "X-TF3-Protocol": str(PROTOCOL_VERSION)}
+        # Build the exact bytes and target we sign; httpx sends them unchanged.
+        target = path + ("?" + urlencode(sorted(params.items())) if params else "")
+        body = b"" if json_body is None else json.dumps(
+            json_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         attempts = 2 if retry_connect else 1
         last_exc: Optional[Exception] = None
         for _ in range(attempts):
+            headers, nonce = self._signed_headers(method, target, body)  # fresh nonce per attempt
             try:
-                with httpx.Client(transport=self._transport, timeout=timeout, follow_redirects=False) as http:
-                    return http.request(method, self.base_url + path, json=json_body, params=params, headers=headers)
+                with httpx.Client(transport=self._transport, timeout=timeout, follow_redirects=False,
+                                  trust_env=False) as http:
+                    resp = http.request(method, self.base_url + target, content=body or None, headers=headers)
             except httpx.ConnectError as exc:
                 # Nothing reached the relay, so one retry is always safe.
                 last_exc = exc
@@ -126,6 +187,8 @@ class BridgeClient:
                 ) from exc
             except httpx.HTTPError as exc:
                 raise BridgeError("transport_error", f"{type(exc).__name__}: {exc}", retryable=True) from exc
+            self._verify_response(resp, nonce)
+            return resp
         raise BridgeError(
             "bridge_unreachable",
             f"cannot reach the TF3 relay at {self.base_url} ({last_exc}). Is the Mac awake, the relay "
@@ -139,8 +202,6 @@ class BridgeClient:
             body = resp.json()
         except ValueError:
             body = None
-        if resp.status_code == 401:
-            raise BridgeError("unauthorized", "relay rejected TF3_BRIDGE_TOKEN", status=401)
         if resp.status_code >= 400 or not isinstance(body, dict) or body.get("ok") is False:
             err = (body or {}).get("error") if isinstance(body, dict) else None
             if isinstance(err, dict):
@@ -164,8 +225,9 @@ class BridgeClient:
              request_id: Optional[str] = None) -> dict:
         """Run one mod op and return its ``result`` object.
 
-        ``request_id`` makes the call idempotent end to end: the relay and the
-        mod both deduplicate on it, so a retried POST never runs an action twice.
+        ``request_id`` makes the call idempotent end to end: calling again with
+        the same id after a timeout picks up the late result instead of
+        queueing the op a second time.
         """
         wait_s = self.timeout_s if timeout_s is None else float(timeout_s)
         body = {
@@ -181,8 +243,10 @@ class BridgeClient:
         result = payload.get("result")
         return result if isinstance(result, dict) else {"value": result}
 
-    def screenshot(self, *, max_width: int = 1600, quality: int = 70) -> Screenshot:
-        params = {"max_width": max(320, min(int(max_width), 3840)), "quality": max(30, min(int(quality), 95))}
+    def screenshot(self, *, max_width: int = 1600, quality: int = 70, source: Optional[str] = None) -> Screenshot:
+        params: dict = {"max_width": max(320, min(int(max_width), 3840)), "quality": max(30, min(int(quality), 95))}
+        if source:
+            params["source"] = source
         resp = self._request("GET", "/v1/screenshot", params=params, timeout_s=45.0)
         mime = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if resp.status_code != 200 or not mime.startswith("image/"):

@@ -213,29 +213,45 @@ EOF
 agent_load "$AGENTS_DIR/$LABEL_RELAY.plist"
 
 PUBKEY="$( [ -f "$KEY.pub" ] && cat "$KEY.pub" || echo "ssh-ed25519 AAAA...(generated on install) hermes-tf3-tunnel")"
+TUNNEL_USER="${VPS%%@*}"
+[ "$TUNNEL_USER" = "$VPS" ] && TUNNEL_USER="<tunnel-user>"
 cat <<EOF
 
-Done on the Mac. Finish on the VPS (as the user in --vps, ideally a dedicated
-low-privilege account):
+Done on the Mac. Finish on the VPS. Use a dedicated low-privilege account for
+the tunnel (e.g. 'sudo useradd -m -s /usr/sbin/nologin $TUNNEL_USER').
 
-  1. Append this single line to ~/.ssh/authorized_keys. It allows ONLY the
-     reverse tunnel to 127.0.0.1:$PORT: no shell, no other forwards.
+  1. Append this single line to that account's ~/.ssh/authorized_keys:
 
      restrict,port-forwarding,permitlisten="127.0.0.1:$PORT",permitopen="127.0.0.1:1",command="/bin/false" $PUBKEY
 
-  2. Put the relay token in the Hermes .env on the VPS (print it on the Mac
-     with: $PYTHON "$SUPPORT_DIR/tf3_relay.py" token):
+  2. As root, add this block at the END of /etc/ssh/sshd_config and reload sshd
+     (sshd -t && systemctl reload sshd). The key options alone still allow
+     unix-socket forwards; this block limits the account to the one tunnel:
+
+     Match User $TUNNEL_USER
+         AllowStreamLocalForwarding no
+         AllowTcpForwarding remote
+         PermitListen 127.0.0.1:$PORT
+         PermitOpen none
+         AllowAgentForwarding no
+         X11Forwarding no
+         PermitTTY no
+         ForceCommand /bin/false
+
+  3. Put the shared token in the Hermes .env on the VPS (print it on the Mac
+     with: $PYTHON "$SUPPORT_DIR/tf3_relay.py" token). It is an HMAC key: it is
+     never sent over the tunnel.
 
      TF3_BRIDGE_TOKEN=<token>
 
-  3. Trust the VPS host key once from this Mac (the tunnel uses
+  4. Trust the VPS host key once from this Mac (the tunnel uses
      StrictHostKeyChecking=yes):   ssh -i "$KEY" -o IdentitiesOnly=yes $VPS true
-     (it will print an error from /bin/false after accepting the key; that is expected)
+     (it exits with an error from /bin/false after accepting the key; that is expected)
 
-  4. Start the tunnel:
+  5. Start the tunnel:
      launchctl bootstrap gui/\$(id -u) "$AGENTS_DIR/$LABEL_TUNNEL.plist"
 
-  5. In Transport Fever 3, enable "Hermes Bridge" in the mod list when you
+  6. Restart Transport Fever 3, enable "Hermes Bridge" in the mod list when you
      start or load a game, then on the VPS run:  hermes tf3 status
 
 Kill switch on the Mac at any time:  $PYTHON "$SUPPORT_DIR/tf3_relay.py" pause

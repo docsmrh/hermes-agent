@@ -36,8 +36,8 @@ This is a Transport Fever 3 mod that lets a Hermes agent running on a VPS observ
 | Tool | Purpose |
 |---|---|
 | `tf3_observe` | Structured game state. Sections: game (date, speed, paused), finance, lines (stops, vehicles, load, last-year balance), vehicles, stations, depots, towns, industries, problems. Can also return one entity, a vehicle-model search, or a `selftest` of the game's API surface. |
-| `tf3_screenshot` | The game renders a screenshot itself, optionally after pointing the camera at an entity or position. It is returned to vision-capable models as an image. |
-| `tf3_act` | Typed actions: `set_speed` (0 pauses), `line_create`, `line_update`, `line_delete`, `vehicle_buy`, `vehicle_set_line`, `vehicle_sell`, `vehicle_to_depot`, `vehicle_stop`, `vehicle_start`, `build_construction`, `bulldoze` and `save_game`. Every action supports `dry_run`; construction dry runs return the game's own validation and cost. |
+| `tf3_screenshot` | The game renders a screenshot itself, optionally after pointing the camera at an entity or position. It is returned to vision-capable models as an image. By default nothing else on your screen can be captured. |
+| `tf3_act` | Typed actions: `set_speed` (0 pauses), `line_create`, `line_update`, `line_delete`, `vehicle_buy`, `vehicle_set_line`, `vehicle_sell`, `vehicle_to_depot`, `vehicle_stop`, `vehicle_start`, `build_construction`, `bulldoze` and `save_game` (always saved as `hermes-<name>`, so your own saves are never overwritten). Every action supports `dry_run`; dry runs of `vehicle_buy` and `build_construction` report the cost. A result is either done, `outcome: not_done`, or `outcome: unknown` (re-observe before retrying). |
 | `tf3_lua` | An escape hatch that runs Lua inside the game. It is off unless you enable it on both sides. |
 | `tf3_journal` | A persistent plan, notes and action log that carry over between autopilot runs. |
 
@@ -69,15 +69,29 @@ It looks for the userdata folder automatically. If it finds none, or more than o
 
 ### 2. VPS
 
-1. Use a dedicated low-privilege user for the tunnel. Add the line the installer printed to that user's `~/.ssh/authorized_keys`:
+1. Use a dedicated low-privilege account for the tunnel. Add the line the installer printed to that account's `~/.ssh/authorized_keys`:
 
    ```
    restrict,port-forwarding,permitlisten="127.0.0.1:47800",permitopen="127.0.0.1:1",command="/bin/false" ssh-ed25519 AAAA… hermes-tf3-tunnel
    ```
 
-   This line was tested against OpenSSH 9.9 `sshd`. It allows only the reverse tunnel onto `127.0.0.1:47800`. It refuses other ports, wildcard binds, local forwards and shells.
+2. As root, add the `Match User` block the installer printed to the end of `/etc/ssh/sshd_config`, then run `sshd -t && systemctl reload sshd`:
 
-2. Install and enable the plugin:
+   ```
+   Match User tunnel
+       AllowStreamLocalForwarding no
+       AllowTcpForwarding remote
+       PermitListen 127.0.0.1:47800
+       PermitOpen none
+       AllowAgentForwarding no
+       X11Forwarding no
+       PermitTTY no
+       ForceCommand /bin/false
+   ```
+
+   Both parts were tested against OpenSSH 9.9 `sshd`. Together they allow only the reverse tunnel onto `127.0.0.1:47800`: other ports, wildcard binds, local forwards, unix-socket forwards and shells are refused. The key line alone does **not** stop unix-socket forwards, so the `Match` block is required.
+
+3. Install and enable the plugin:
 
    ```bash
    ln -s /path/to/hermes-agent/integrations/transport-fever-3/hermes-plugin/tf3 ~/.hermes/plugins/tf3
@@ -85,9 +99,9 @@ It looks for the userdata folder automatically. If it finds none, or more than o
    hermes plugins enable tf3
    ```
 
-3. Put the token in the Hermes `.env`: `TF3_BRIDGE_TOKEN=<value of "tf3_relay.py token" on the Mac>`.
+4. Put the token in the Hermes `.env`: `TF3_BRIDGE_TOKEN=<value of "tf3_relay.py token" on the Mac>`. It is used as an HMAC key and never sent over the tunnel.
 
-4. On the Mac, accept the VPS host key once, then start the tunnel. The installer prints both commands.
+5. On the Mac, accept the VPS host key once, then start the tunnel. The installer prints both commands.
 
 ### 3. In the game
 
@@ -108,9 +122,9 @@ hermes cron create "every 15m" "Play one Transport Fever 3 autopilot turn: ..." 
 hermes cron pause tf3-autopilot   # stop the loop
 ```
 
-- Each run is one Hermes cron session, capped by the cron hard time limit and by `max_actions_per_session`.
+- Each run is one Hermes cron session, capped by the cron hard time limit and by `max_actions_per_session`. The budget counts the whole run, including compressed continuations and delegated subagents, and survives a gateway restart.
 - Continuity comes from `tf3_journal`, because cron sessions skip memory.
-- Keep the Mac awake, with the game running and unpaused. The simulation does not run commands while the game is paused, but `set_speed` can unpause it.
+- Keep the Mac awake, with the game running and unpaused. While the game is paused, actions are refused instead of queued. The agent does not resume a game you paused unless you set `allow_unpause: true`; it may resume a pause it made itself if the game has not moved since.
 
 ## Configuration
 
@@ -121,37 +135,53 @@ hermes cron pause tf3-autopilot   # stop the loop
 | `bridge_url` | `http://127.0.0.1:47800` | The VPS end of the tunnel |
 | `request_timeout_s` | 30 | How long to wait per call |
 | `readonly` | false | Refuse every action |
-| `max_actions_per_session` | 40 | Cap on mutating calls per session or cron run (dry runs are free) |
-| `min_cash_reserve` | 0 (off) | Refuse spending actions while the balance is below this |
-| `blocked_actions` | `[]` | For example `["bulldoze", "vehicle_sell", "line_delete"]` |
+| `max_actions_per_session` | 40 | Cap on mutating calls per run: one conversation or cron run, including its compressed continuations and subagents (dry runs are free) |
+| `min_cash_reserve` | 0 (off) | Refuse a spending action if its cost (from a dry run) would take the balance below this, or if the cost is unknown |
+| `blocked_actions` | `[]` | For example `["bulldoze", "vehicle_sell", "line_delete"]`. Blocking `vehicle_sell` also blocks `vehicle_to_depot` with `sell_on_arrival`. |
+| `allow_unpause` | false | Let the agent resume a game the player paused |
 | `enable_lua_tool` | false | Expose `tf3_lua`. The Mac must also allow it. |
 | `screenshot_max_width` | 1600 | Downscale target |
+| `screenshot_source` | unset | Optionally narrow the screenshot source (`game`). It can never exceed the Mac's setting. |
 | `allow_remote_bridge` | false | Allow a non-loopback `bridge_url` (https only) |
 
-**Mac** (`~/Library/Application Support/hermes-tf3-bridge/config.json`, mode 0600):
+**Mac** (`~/Library/Application Support/hermes-tf3-bridge/config.json`, mode 0600). Edits take effect within a second; there is no need to restart the relay. Changing `port` or `userdata_dir` is the exception and does need a restart.
 - `allow_actions` (true), `allow_save` (true), `allow_lua` (false);
-- `screenshot_enabled` (true), `screenshot_source` (`auto` | `game` | `screen`), `keep_game_screenshots` (false);
+- `screenshot_enabled` (true), `keep_game_screenshots` (false);
+- `screenshot_source`:
+  - `game` (default): only the game's own renderer, so nothing else on your screen is ever captured;
+  - `auto`: the game, else a capture of the whole display;
+  - `screen`: always the whole display.
+
+  The VPS can only narrow this, never widen it.
 - `rate_limit_per_s` (10), `port` (47800), `userdata_dir`.
 
-**Kill switch.** `tf3_relay.py pause` makes the relay refuse every state-changing op; reads and screenshots keep working. Undo it with `tf3_relay.py resume`.
+**Kill switch.** `tf3_relay.py pause` makes the relay refuse every state-changing op, and the mod refuses any already queued. Reads and screenshots keep working. Undo it with `tf3_relay.py resume`.
 
 ## Security model
 
 - **Trust boundary.** The Mac is the authority. The relay enforces the policy flags and the kill switch whatever the VPS asks. A compromised VPS can do at most what the relay allows, and by default that excludes running Lua.
 - **Network exposure.** No listening port on the Mac's network interfaces. The relay binds `127.0.0.1`, and the Mac dials out to the VPS.
-- **Tunnel key.** The tunnel key can only create that one loopback forward on the VPS.
-- **Auth.** A bearer token checked in constant time. The relay pins the Host header (which defeats DNS rebinding) and limits bodies (256 KiB), request ids, request rate and pending requests.
-  - The plugin never sends the token to a non-loopback host unless you explicitly allow it, and then only over https.
-  - Tokens are never printed by `init` or written to logs.
-  - To rotate the token, run `tf3_relay.py init --rotate-token` and update the VPS `.env`.
-- **Op allowlist.** Ops not on the allowlist never reach the game.
+- **Tunnel key.** With the `Match` block, the tunnel account can only create that one loopback forward on the VPS.
+- **Auth.** The shared token is an HMAC-SHA256 key and is never sent over the wire.
+  - Every request is signed over method, path, timestamp, nonce and body hash. Requests outside a 60 s window and replayed nonces are refused.
+  - Every response is signed back. If the tunnel is down and another local user on the VPS listens on `127.0.0.1:47800`, that user learns nothing reusable, and the plugin reports `relay_unauthenticated` instead of trusting the answers.
+  - The plugin ignores `HTTP(S)_PROXY`.
+  - The relay pins the Host header (which defeats DNS rebinding). It limits:
+    - bodies (256 KiB), args per request (32 KiB) and total pending args (512 KiB);
+    - JSON nesting (32 levels; NaN and Infinity are refused);
+    - request ids, request rate, screenshot rate and pending requests;
+    - concurrent connections, with a 15 s socket timeout.
+  - The token is never printed by `init` or written to logs. To rotate it, run `tf3_relay.py init --rotate-token` (it takes effect immediately) and update the VPS `.env`.
+- **Op allowlist and policy.** Ops not on the allowlist never reach the game. The relay publishes its policy to the mod, which re-checks every request and refuses anything without a policy.
+- **No cross-game replay.** Each request carries the stamp of the game load it was queued for. On a reload, pending actions fail with `game_reloaded` instead of running against the new save.
+- **No late surprises.** A forwarded command has a 75 s deadline. If the simulation reaches it later, the command is refused, so `engine_timeout` means nothing was done.
 - **`lua_eval` is code execution inside the game.** Game Lua can call `app.*`, which can save, load or delete games and quit TF3. Keep it off unless you need it. `tf3_act` covers normal play.
 - **Exchange-folder trust.** The game executes the exchange files as Lua when it loads them. Anything that can write to your TF3 userdata folder can therefore already run Lua in the game. The relay only ever writes a table of plain strings.
 - **Engine-crash guard.** `getComponent` on a deleted entity crashes the game (a fatal engine assertion, not a Lua error), and entity ids are reused. The mod checks `entityExists` before every read.
 
 ## Verification
 
-**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 80 tests.
+**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 120 tests.
 - The real mod Lua runs under Lua 5.2 (`lupa`, optional; those tests are skipped without it). It runs against `tests/plugins/tf3/fake_game.lua`, a stand-in for the TF3 script runtime with real userdata files and a crash-strict `getComponent`.
 - The real relay and the real plugin run unchanged.
 - The end-to-end tests drive Hermes tools → HTTP → relay → files → mod → simulated engine and back.

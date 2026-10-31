@@ -22,6 +22,12 @@ from tests.plugins.tf3.harness import MOD_CONTENT, MOD_DIR, FakeGame, load_relay
 
 R = load_relay()
 
+OPEN_POLICY = {"paused": False, "allow_actions": True, "allow_save": True, "allow_lua": True}
+
+
+def open_policy():
+    return dict(OPEN_POLICY)
+
 
 @pytest.fixture
 def game(tmp_path):
@@ -33,7 +39,7 @@ def game(tmp_path):
 
 @pytest.fixture
 def channel(game):
-    ch = R.ModChannel(game.userdata / "heightmaps", poll_s=0.01)
+    ch = R.ModChannel(game.userdata / "heightmaps", poll_s=0.01, policy_fn=open_policy)
     ch.poll_once()
     ch.start()
     game.start()
@@ -56,9 +62,11 @@ def call(ch, op, args=None, request_id=None, timeout=10):
 
 def test_json_codec_round_trips(game):
     j = game.rt.execute((MOD_CONTENT / "hermes_bridge" / "json.lua").read_text())
-    sample = {"a": 1, "b": [1, 2.5, "x"], "c": "é\n\"q\"", "d": None, "e": True, "f": [], "g": {"h": []}}
+    sample = {"a": 1, "b": [1, 2.5, "x"], "c": "é\n\"q\"", "e": True, "f": [], "g": {"h": []}}
     text = json.dumps(sample, ensure_ascii=False)
     assert json.loads(j.encode(j.decode(text))) == sample
+    # null object members mean "not given" and are dropped; nulls in arrays stay
+    assert json.loads(j.encode(j.decode('{"a": null, "b": [1, null, 2]}'))) == {"b": [1, None, 2]}
     for bad in ['{"a":}', "[1,]", '"open', '{"a":1} trailing']:
         with pytest.raises(Exception):
             j.decode(bad)
@@ -205,7 +213,7 @@ def test_engine_executes_each_request_once_across_relay_restarts(channel, game):
     rid = "exactly-once-1"
     call(channel, "vehicle_stop", {"vehicle_id": 500}, request_id=rid)
     channel.stop()
-    restarted = R.ModChannel(game.userdata / "heightmaps", poll_s=0.01)  # new session, same request id
+    restarted = R.ModChannel(game.userdata / "heightmaps", poll_s=0.01, policy_fn=open_policy)  # new session
     restarted.poll_once()
     restarted.start()
     try:
@@ -238,7 +246,7 @@ def test_engine_ops_are_refused_while_paused(channel, game):
 
 def test_paused_simulation_times_out_engine_ops(tmp_path):
     g = FakeGame(tmp_path / "userdata")
-    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01)
+    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01, policy_fn=open_policy)
     g.run(3)
     ch.poll_once()
     ch.start()
@@ -260,11 +268,17 @@ def test_paused_simulation_times_out_engine_ops(tmp_path):
         g.advance_time(120)
         with pytest.raises(R.RelayError) as exc:
             call(ch, "line_delete", {"line_id": 100}, request_id=rid, timeout=5)
-        assert exc.value.code == "engine_timeout"
+        assert exc.value.code == "engine_timeout" and exc.value.retryable  # definitive: it will never run
     finally:
         stop = True
         t.join()
         ch.stop()
+    # When the simulation finally steps, the stale command is refused, not run.
+    g.step()
+    assert "line_destroy" not in g.log_kinds()
+    with g.lock:
+        stored = g.G.engine_state.get(g.G.engine_state)  # Lua method call: state:get()
+        assert stored.hermes_bridge_results[rid].error.code == "expired"
 
 
 def test_gui_errors_are_contained(game):
@@ -283,3 +297,147 @@ def test_mod_package_is_consistent():
     assert listed == on_disk
     # TF3's mod guidelines forbid executables/scripts inside a mod folder.
     assert not [p for p in MOD_DIR.rglob("*") if p.suffix in {".py", ".sh", ".command", ".exe", ".bat"}]
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the adversarial review
+# ---------------------------------------------------------------------------
+
+def test_recreated_gui_state_gets_a_fresh_stamp_and_recovers(channel, game):
+    assert call(channel, "ping")["result"]["pong"]
+    old = {p.name for p in (game.userdata / "heightmaps").glob("hermes_bridge__in_*")}
+    with game.lock:  # the game drops the whole GUI Lua state (package.loaded included)
+        game.rt.execute("package.loaded.hermes_bridge_gui_state = nil")
+    game.load_script()
+    new = {p.name for p in (game.userdata / "heightmaps").glob("hermes_bridge__in_*")} - old
+    deadline = time.time() + 10
+    while not new and time.time() < deadline:
+        time.sleep(0.05)
+        new = {p.name for p in (game.userdata / "heightmaps").glob("hermes_bridge__in_*")} - old
+    assert new, "a fresh stamp (new inbox) is expected after the GUI state is recreated"
+    assert call(channel, "ping")["result"]["pong"]  # the relay follows the new stamp
+
+
+def test_pending_actions_are_not_replayed_into_a_reloaded_game(tmp_path):
+    g = FakeGame(tmp_path / "userdata")
+    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01, policy_fn=open_policy)
+    g.run(3)
+    ch.poll_once()
+    ch.start()
+    try:
+        # GUI frames only: the vehicle_stop is forwarded but the simulation never runs it.
+        for _ in range(30):
+            g.frame()
+        import threading
+        out = {}
+        t = threading.Thread(target=lambda: out.update(res=ch.call("vehicle_stop", {"vehicle_id": 500}, "replay-1", 8)))
+        t.start()
+        time.sleep(0.5)
+        for _ in range(30):
+            g.frame()
+        with g.lock:  # the player loads another save: fresh GUI state, fresh stamp
+            g.rt.execute("package.loaded.hermes_bridge_gui_state = nil")
+        g.load_script()
+        g.start()
+        t.join(timeout=15)
+        assert out["res"]["ok"] is False and out["res"]["error"]["code"] == "game_reloaded"
+        # It was not re-sent into the new load's inbox...
+        for path in (g.userdata / "heightmaps").glob("hermes_bridge__in_*.lua"):
+            inbox = R.parse_parts_file(path.read_bytes()) or {}
+            assert all(r["op"] != "vehicle_stop" for r in inbox.get("requests", [])), path.name
+    finally:
+        g.stop()
+        ch.stop()
+    # ...so it ran at most once. (Here the "reload" only reset the GUI state, so the
+    # command already queued in the same game may still run; a real save load drops it.)
+    assert g.log_kinds().count("vehicle_stopped") <= 1
+
+
+def test_kill_switch_reaches_requests_already_queued(tmp_path):
+    g = FakeGame(tmp_path / "userdata")
+    policy = dict(OPEN_POLICY)
+    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01, policy_fn=lambda: dict(policy))
+    g.run(3)
+    ch.poll_once()
+    policy["paused"] = True  # `tf3_relay.py pause` lands before the mod picks the request up
+    ch.start()
+    g.start()
+    try:
+        res = ch.call("vehicle_stop", {"vehicle_id": 500}, "queued-1", 10)
+    finally:
+        g.stop()
+        ch.stop()
+    assert res["ok"] is False and res["error"]["code"] == "paused"
+    assert "vehicle_stopped" not in g.log_kinds()
+
+
+def test_mod_refuses_everything_but_reads_without_a_policy(tmp_path):
+    g = FakeGame(tmp_path / "userdata")
+    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01)  # default: fail closed
+    g.run(3)
+    ch.poll_once()
+    ch.start()
+    g.start()
+    try:
+        assert ch.call("ping", {}, "r-1", 10)["ok"] is True
+        res = ch.call("vehicle_stop", {"vehicle_id": 500}, "w-1", 10)
+    finally:
+        g.stop()
+        ch.stop()
+    assert res["error"]["code"] == "policy_denied"
+
+
+def test_null_params_mean_absent(channel, game):
+    call(channel, "line_update", {"line_id": 100, "stops": [200, 201], "name": None})
+    assert game.find_logged("set_name") is None  # not renamed to "null"
+    res = call(channel, "vehicle_buy", {"depot_id": 400, "model": "vehicle/bus/old_bus.mdl", "line_id": None,
+                                        "models": None})["result"]
+    assert res["vehicle_id"] and "line_assigned" not in res
+
+
+def test_stop_validation_rejects_stale_and_out_of_range_input(channel, game):
+    bad_stops = [
+        [{"station_group_id": 999999, "station_index": 0}, 201],   # group gone
+        [{"station_group_id": 300, "station_index": 5}, 201],      # index past the group
+        [{"station_id": 200, "terminal": 9}, 201],                 # no such platform
+        [{"station_id": 200, "terminal": -1}, 201],
+    ]
+    for stops in bad_stops:
+        with pytest.raises(R.RelayError) as exc:
+            call(channel, "line_create", {"name": "Bad", "stops": stops, "dry_run": True})
+        assert exc.value.code in {"invalid_argument", "not_found"}, stops
+    ok = call(channel, "line_create", {"name": "Good", "stops": [{"station_group_id": 300, "station_index": 0},
+                                                                  {"station_id": 201, "terminal": 1}],
+                                       "dry_run": True})
+    assert ok["result"]["valid"]
+    with pytest.raises(R.RelayError) as exc:
+        call(channel, "vehicle_set_line", {"vehicle_id": 500, "line_id": 100, "stop_index": 7})
+    assert exc.value.code == "invalid_argument"
+    assert game.G.fatal_reads == 0
+
+
+def test_camera_focus_checks_the_entity(channel, game):
+    with pytest.raises(R.RelayError) as exc:
+        call(channel, "camera_focus", {"entity_id": 31337})
+    assert exc.value.code == "not_found"
+    with game.lock:
+        assert game.G.camera.entity is None
+    assert game.G.fatal_reads == 0
+
+
+def test_agent_saves_are_namespaced(channel, game):
+    assert call(channel, "save_game", {"name": "career"})["result"]["saved"] == "hermes-career"
+    assert call(channel, "save_game", {"name": "hermes-x"})["result"]["saved"] == "hermes-x"
+    with pytest.raises(R.RelayError):
+        call(channel, "save_game", {"name": "My Career Save"})
+    with game.lock:
+        saved = [game.G.saved_games[i] for i in range(1, len(game.G.saved_games) + 1)]
+    assert saved == ["hermes-career", "hermes-x"]
+
+
+def test_vehicle_buy_dry_run_reports_cost(channel):
+    res = call(channel, "vehicle_buy", {"depot_id": 400, "model": "vehicle/bus/old_bus.mdl", "dry_run": True})
+    assert res["result"]["cost"] == 60000
+    with pytest.raises(R.RelayError) as exc:  # not invented yet in 1905
+        call(channel, "vehicle_buy", {"depot_id": 400, "model": "vehicle/tram/old_tram.mdl", "dry_run": True})
+    assert exc.value.code == "invalid_argument"

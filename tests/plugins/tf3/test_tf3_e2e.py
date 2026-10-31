@@ -129,3 +129,22 @@ def test_mod_errors_reach_the_agent(stack):
     out = tool(plugin, "tf3_act", {"action": "vehicle_sell", "params": {"vehicle_id": 999999}, "reason": "x"})
     assert out["code"] == "not_found" and "999999" in out["error"]
     assert game.G.fatal_reads == 0
+
+
+def test_proxy_environment_is_ignored(stack, monkeypatch):
+    """HTTP(S)_PROXY must not route the bridge (or its signatures) through a proxy."""
+    plugin, ctx, game, cfg = stack
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(var, "http://127.0.0.1:9")  # nothing listens there
+    monkeypatch.setenv("NO_PROXY", "hermes")
+    assert "snapshot" in tool(plugin, "tf3_observe", {"sections": ["game"]})
+
+
+def test_token_mismatch_is_caught_on_both_sides(stack, monkeypatch):
+    plugin, ctx, game, cfg = stack
+    monkeypatch.setenv("TF3_BRIDGE_TOKEN", "not-the-mac-token-" + "q" * 30)
+    out = tool(plugin, "tf3_observe", {})
+    # The relay refuses the signature, and its signed refusal does not verify
+    # under the wrong key either, so the plugin reports it as unauthenticated.
+    assert out["code"] == "relay_unauthenticated"
+    assert "game" not in str(out.get("snapshot", ""))

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
-from typing import Any, Callable, Optional
+import uuid
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from tools.registry import tool_error, tool_result
 
@@ -22,6 +24,7 @@ from .guardrails import (
     Settings,
     check_action,
     check_cash_reserve,
+    effective_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,8 +32,12 @@ logger = logging.getLogger(__name__)
 TOKEN_ENV = "TF3_BRIDGE_TOKEN"
 SNAPSHOT_SECTIONS = ("game", "finance", "lines", "vehicles", "stations", "depots", "towns", "industries", "problems")
 DEFAULT_SECTIONS = ["game", "finance", "lines", "problems"]
-# Errors after which the action may still take effect in the game.
-_OUTCOME_UNKNOWN = frozenset({"timeout", "engine_timeout", "transport_error"})
+# Errors after which a state change may still take effect in the game.
+_OUTCOME_UNKNOWN = frozenset({"timeout", "transport_error", "game_reloaded"})
+# Errors worth re-asking about with the same request id (the relay keeps the
+# request and hands back its late result; it is never queued twice).
+_RETRY_SAME_ID = frozenset({"timeout", "transport_error"})
+_RETRY_WINDOW_S = 110.0
 _JOURNAL_MAX_ENTRIES = 300
 _JOURNAL_MAX_TEXT = 1500
 _PLAN_MAX_TEXT = 4000
@@ -43,8 +50,9 @@ _budget = ActionBudget()
 
 
 def bind(ctx: Any) -> None:
-    global _ctx
+    global _ctx, _budget
     _ctx = ctx
+    _budget = ActionBudget(get=_state_get, set=_state_set)
 
 
 def _setting(key: str, default: Any = None) -> Any:
@@ -64,6 +72,7 @@ def _settings() -> Settings:
         "max_actions_per_session": _setting("max_actions_per_session"),
         "min_cash_reserve": _setting("min_cash_reserve"),
         "blocked_actions": _setting("blocked_actions"),
+        "allow_unpause": _setting("allow_unpause"),
     })
 
 
@@ -99,10 +108,6 @@ def check_tf3_lua_available() -> bool:
     return check_tf3_available() and _setting("enable_lua_tool", False) is True
 
 
-def _session_key(kwargs: dict) -> str:
-    return str(kwargs.get("session_id") or kwargs.get("task_id") or "default")
-
-
 def _state_get(key: str, default: Any) -> Any:
     if _ctx is None:
         return default
@@ -117,6 +122,51 @@ def _state_set(key: str, value: Any) -> None:
     if _ctx is None:
         return
     _ctx.state.set(key, value)
+
+
+# ---------------------------------------------------------------------------
+# Run identity (what the action budget counts against)
+# ---------------------------------------------------------------------------
+
+_root_lock = threading.Lock()
+_root_cache: Dict[str, Tuple[str, float]] = {}
+_ROOT_RECHECK_S = 60.0
+
+
+def _lookup_conversation_root(session_id: str) -> str:
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            return str(db.get_conversation_root(session_id) or session_id)
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("tf3: session lineage lookup failed", exc_info=True)
+        return session_id
+
+
+def _run_key(kwargs: dict) -> str:
+    """The session-lineage root: context compression rotates session_id and
+    delegate subagents get their own, but all of them share one root, so a
+    run cannot reset its action budget by compressing or delegating."""
+    sid = str(kwargs.get("session_id") or "")
+    if not sid:
+        return str(kwargs.get("task_id") or "default")
+    now = time.monotonic()
+    with _root_lock:
+        cached = _root_cache.get(sid)
+        # A root equal to the id itself may just mean the parent row is not
+        # written yet, so that answer is re-checked after a while.
+        if cached and (cached[0] != sid or now - cached[1] < _ROOT_RECHECK_S):
+            return cached[0]
+    root = _lookup_conversation_root(sid)
+    with _root_lock:
+        if len(_root_cache) > 1024:
+            _root_cache.clear()
+        _root_cache[sid] = (root, now)
+    return root
 
 
 def _now_iso() -> str:
@@ -152,6 +202,50 @@ def _int_arg(args: dict, key: str, default: int, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(lo, min(hi, value))
+
+
+def _drop_nulls(value: Any) -> Any:
+    """Models often send null for "not given"; treat it as absent everywhere."""
+    if isinstance(value, dict):
+        return {k: _drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_nulls(v) for v in value]
+    return value
+
+
+def _call_state_change(client: BridgeClient, op: str, args: dict) -> Tuple[str, dict]:
+    """Run a state-changing op; after a timeout ask again with the *same*
+    request id, which returns the late result instead of queueing it twice.
+    Returns (request_id, result); errors carry ``request_id``."""
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    while True:
+        try:
+            return request_id, client.call(op, args, request_id=request_id)
+        except BridgeError as exc:
+            exc.request_id = request_id  # type: ignore[attr-defined]
+            if exc.code in _RETRY_SAME_ID and time.monotonic() - started < _RETRY_WINDOW_S:
+                if exc.code == "transport_error":
+                    time.sleep(1.0)  # a timeout already waited; a broken connection should not spin
+                continue
+            raise
+
+
+def _record_action(entry: dict) -> None:
+    try:
+        log = list(_state_get("action_log", []))[-(_ACTION_LOG_MAX - 1):]
+        log.append(entry)
+        _state_set("action_log", log)
+    except Exception:
+        logger.warning("tf3: could not persist action log entry", exc_info=True)
+
+
+def _failure_result(exc: BridgeError, *, request_id: str) -> str:
+    if exc.code in _OUTCOME_UNKNOWN:
+        return tool_error(exc.message, code=exc.code, retryable=False, outcome="unknown", request_id=request_id,
+                          next_step="Re-observe and check whether the change happened before trying again.")
+    return tool_error(exc.message, code=exc.code, retryable=exc.retryable, outcome="not_done",
+                      request_id=request_id)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +284,7 @@ TF3_OBSERVE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional: list vehicle model files whose path contains this text (e.g. 'bus', 'tram'), "
-                    "with id, availability years and whether each is available in the current game year."
+                    "with id, availability years, price and whether each is available in the current game year."
                 ),
             },
             "selftest": {
@@ -228,9 +322,10 @@ def handle_tf3_observe(args: dict, **kwargs: Any) -> str:
         "snapshot": snapshot,
         "guardrails": {
             "readonly": settings.readonly,
-            "actions_used_this_session": _budget.used(_session_key(kwargs)),
+            "actions_used_this_run": _budget.used(_run_key(kwargs)),
             "max_actions_per_session": settings.max_actions_per_session,
             "min_cash_reserve": settings.min_cash_reserve,
+            "allow_unpause": settings.allow_unpause,
         },
     })
 
@@ -243,9 +338,9 @@ TF3_SCREENSHOT_SCHEMA = {
     "name": "tf3_screenshot",
     "description": (
         "Take a Transport Fever 3 screenshot on the Mac and return it as an image. The game renders it itself "
-        "(no screen-recording permission needed); optionally point the camera at an entity or position first. "
-        "Use it to judge map layout, terrain and placement that tf3_observe cannot describe. Images are "
-        "expensive: prefer tf3_observe for numbers."
+        "(nothing else on the user's screen is captured unless the Mac owner allowed that); optionally point "
+        "the camera at an entity or position first. Use it to judge map layout, terrain and placement that "
+        "tf3_observe cannot describe. Images are expensive: prefer tf3_observe for numbers."
     ),
     "parameters": {
         "type": "object",
@@ -279,7 +374,9 @@ def handle_tf3_screenshot(args: dict, **kwargs: Any) -> Any:
         client.call("camera_focus", {"position": list(args["focus_position"]),
                                      "distance": float(args.get("distance") or 500)})
         time.sleep(1.0)
-    shot = client.screenshot(max_width=_int_arg(args, "max_width", default_width, 320, 3840))
+    source = _setting("screenshot_source", None)
+    shot = client.screenshot(max_width=_int_arg(args, "max_width", default_width, 320, 3840),
+                             source=str(source) if source in {"game", "auto", "screen"} else None)
     b64 = base64.b64encode(shot.data).decode("ascii")
     dims = f"{shot.width}x{shot.height}" if shot.width and shot.height else "unknown size"
     summary = (f"Transport Fever 3 screenshot from the Mac ({dims}, {len(shot.data):,} bytes, "
@@ -304,8 +401,8 @@ TF3_ACT_SCHEMA = {
     "name": "tf3_act",
     "description": (
         "Change the Transport Fever 3 game through the hermes_bridge mod. Pick an action and pass its params. "
-        "Entity ids come from tf3_observe. Commands run in the simulation, so they stall while the game is "
-        "paused (set_speed works anyway). The result says whether the game accepted them; re-observe to verify. "
+        "Entity ids come from tf3_observe. Commands run in the simulation, so they are refused while the game "
+        "is paused. The result says whether the game accepted them; re-observe to verify. "
         "Params by action:\n"
         "set_speed {speedup:int 0-4, 0 = pause}; "
         "line_create {name, stops:[station_id,...] or [{station_id, terminal?},...], color?:[r,g,b] 0-1}; "
@@ -315,9 +412,9 @@ TF3_ACT_SCHEMA = {
         "vehicle_set_line {vehicle_id, line_id, stop_index?}; vehicle_sell {vehicle_id}; "
         "vehicle_to_depot {vehicle_id, sell_on_arrival?}; vehicle_stop {vehicle_id}; vehicle_start {vehicle_id}; "
         "build_construction {file (e.g. '::/depots/road/road_depot/road_depot.con'), position:[x,y,z], "
-        "rotation?:radians, params?:{...}, name?} — run with dry_run first, it reports errors and costs; the "
+        "rotation?:radians, params?:{...}, name?} — dry-run it first, that reports errors and cost; the "
         "result lists depot_ids/station_ids inside the new construction; "
-        "bulldoze {entity_id of a construction}; save_game {name}."
+        "bulldoze {entity_id of a construction}; save_game {name} (saved as hermes-<name>)."
     ),
     "parameters": {
         "type": "object",
@@ -338,13 +435,44 @@ TF3_ACT_SCHEMA = {
 }
 
 
-def _record_action(entry: dict) -> None:
+def _finance_balance(client: BridgeClient) -> Optional[float]:
+    finance = client.call("snapshot", {"sections": ["finance"], "limit": 1}).get("finance") or {}
+    balance = finance.get("balance")
+    return float(balance) if isinstance(balance, (int, float)) and not isinstance(balance, bool) else None
+
+
+def _check_unpause(client: BridgeClient, params: dict, settings: Settings) -> None:
+    """Do not resume a game the player paused, unless the user allowed it or
+    the pause was the agent's own and the game has not moved since."""
     try:
-        log = list(_state_get("action_log", []))[-(_ACTION_LOG_MAX - 1):]
-        log.append(entry)
-        _state_set("action_log", log)
-    except Exception:
-        logger.warning("tf3: could not persist action log entry", exc_info=True)
+        speedup = int(params.get("speedup"))
+    except (TypeError, ValueError):
+        return  # the mod rejects it with a proper message
+    if speedup <= 0 or settings.allow_unpause:
+        return
+    game = client.call("snapshot", {"sections": ["game"], "limit": 1}).get("game") or {}
+    if game.get("paused") is not True:
+        return
+    own = _state_get("agent_pause", None)
+    if isinstance(own, dict) and own.get("game_time") == game.get("game_time"):
+        return
+    raise GuardrailError(
+        "player_paused",
+        "the game is paused and tf3 does not resume a game the player paused "
+        "(plugins.entries.tf3.settings.allow_unpause: true allows it). Journal it and end the turn.",
+    )
+
+
+def _note_speed_change(client: BridgeClient, params: dict) -> None:
+    try:
+        speedup = int(params.get("speedup"))
+    except (TypeError, ValueError):
+        return
+    if speedup == 0:
+        game = client.call("snapshot", {"sections": ["game"], "limit": 1}).get("game") or {}
+        _state_set("agent_pause", {"game_time": game.get("game_time"), "ts": _now_iso()})
+    else:
+        _state_set("agent_pause", None)
 
 
 @_guarded
@@ -353,42 +481,51 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
     params = args.get("params") or {}
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
+    params = _drop_nulls(params)
+    # A dry run asked for anywhere stays a dry run; never let one side
+    # silently turn the other into a real action.
+    dry_run = args.get("dry_run") is True or params.pop("dry_run", None) is True
     reason = str(args.get("reason") or "").strip()[:500]
-    dry_run = args.get("dry_run") is True
     settings = _settings()
-    action_class = check_action(action, settings)
+    action_class = check_action(action, settings, params)
     client = _client()
-
-    if action_class == "spend" and settings.min_cash_reserve > 0 and not dry_run:
-        finance = client.call("snapshot", {"sections": ["finance"], "limit": 1}).get("finance") or {}
-        balance = finance.get("balance")
-        check_cash_reserve(float(balance) if isinstance(balance, (int, float)) else None, settings)
-
-    session = _session_key(kwargs)
-    if not dry_run:
-        _budget.consume(session, settings.max_actions_per_session)
-
+    run = _run_key(kwargs)
+    session = str(kwargs.get("session_id") or "")
     started = time.monotonic()
+
+    if dry_run:
+        result = client.call(action, {**params, "dry_run": True})
+        return tool_result({"action": action, "dry_run": True, "result": result,
+                            "elapsed_ms": int((time.monotonic() - started) * 1000)})
+
+    if effective_action(action, params) == "set_speed":
+        _check_unpause(client, params, settings)
+    if action_class == "spend" and settings.min_cash_reserve > 0:
+        preview = client.call(action, {**params, "dry_run": True})
+        cost = preview.get("cost")
+        check_cash_reserve(_finance_balance(client),
+                           float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+                           settings)
+    used = _budget.consume(run, settings.max_actions_per_session)
+
+    entry = {"ts": _now_iso(), "session": session, "run": run, "action": action, "params": params,
+             "reason": reason}
     try:
-        result = client.call(action, {**params, "dry_run": dry_run})
+        request_id, result = _call_state_change(client, action, {**params, "dry_run": False})
     except BridgeError as exc:
-        if not dry_run:
-            _record_action({"ts": _now_iso(), "session": session, "action": action, "params": params,
-                            "reason": reason, "ok": False, "error": exc.to_dict()})
-        if exc.code in _OUTCOME_UNKNOWN and not dry_run:
-            # The game may still carry the action out; a blind retry could do it twice.
-            return tool_error(exc.message, code=exc.code, retryable=False, outcome="unknown",
-                              next_step="Re-observe and check whether the change happened before retrying.")
-        raise
-    if not dry_run:
-        _record_action({"ts": _now_iso(), "session": session, "action": action, "params": params,
-                        "reason": reason, "ok": True, "result": result})
+        request_id = getattr(exc, "request_id", "")
+        _record_action({**entry, "request_id": request_id, "ok": False, "error": exc.to_dict()})
+        return _failure_result(exc, request_id=request_id)
+    _record_action({**entry, "request_id": request_id, "ok": True, "result": result})
+    if action == "set_speed":
+        _note_speed_change(client, params)
     return tool_result({
         "action": action,
-        "dry_run": dry_run,
+        "dry_run": False,
         "result": result,
+        "request_id": request_id,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
-        "actions_used_this_session": _budget.used(session),
+        "actions_used_this_run": used,
         "next_step": "Re-observe to confirm the game state changed as intended.",
     })
 
@@ -426,12 +563,18 @@ def handle_tf3_lua(args: dict, **kwargs: Any) -> str:
     settings = _settings()
     if settings.readonly:
         raise GuardrailError("readonly", "tf3 is in readonly mode (plugins.entries.tf3.settings.readonly)")
-    session = _session_key(kwargs)
-    _budget.consume(session, settings.max_actions_per_session)
-    result = _client().call("lua_eval", {"code": code})
-    _record_action({"ts": _now_iso(), "session": session, "action": "lua_eval",
-                    "reason": str(args.get("reason") or "")[:500], "ok": True, "code_chars": len(code)})
-    return tool_result({"result": result, "actions_used_this_session": _budget.used(session)})
+    run = _run_key(kwargs)
+    used = _budget.consume(run, settings.max_actions_per_session)
+    entry = {"ts": _now_iso(), "session": str(kwargs.get("session_id") or ""), "run": run, "action": "lua_eval",
+             "reason": str(args.get("reason") or "")[:500], "code_chars": len(code)}
+    try:
+        request_id, result = _call_state_change(_client(), "lua_eval", {"code": code})
+    except BridgeError as exc:
+        request_id = getattr(exc, "request_id", "")
+        _record_action({**entry, "request_id": request_id, "ok": False, "error": exc.to_dict()})
+        return _failure_result(exc, request_id=request_id)
+    _record_action({**entry, "request_id": request_id, "ok": True})
+    return tool_result({"result": result, "request_id": request_id, "actions_used_this_run": used})
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +620,8 @@ def handle_tf3_journal(args: dict, **kwargs: Any) -> str:
         raise ValueError(f"text is required for action={action!r}")
     if action == "append":
         entries = list(_state_get("journal", []))[-(_JOURNAL_MAX_ENTRIES - 1):]
-        entries.append({"ts": _now_iso(), "session": _session_key(kwargs), "text": text[:_JOURNAL_MAX_TEXT]})
+        entries.append({"ts": _now_iso(), "session": str(kwargs.get("session_id") or ""),
+                        "text": text[:_JOURNAL_MAX_TEXT]})
         _state_set("journal", entries)
         return tool_result({"ok": True, "total_entries": len(entries), "truncated": len(text) > _JOURNAL_MAX_TEXT})
     if action == "set_plan":

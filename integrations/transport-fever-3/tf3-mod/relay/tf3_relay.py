@@ -11,17 +11,21 @@ the mod — but it *is* the security authority on the Mac:
 
 * listens on 127.0.0.1 only (reach it from the VPS through an SSH reverse
   tunnel; never expose it on a LAN or the internet);
-* requires ``Authorization: Bearer <token>`` (constant-time compare);
+* authenticates every request with an HMAC-SHA256 signature over method,
+  path, timestamp, nonce and body (the shared token itself never crosses the
+  wire; stale and replayed requests are refused), and signs every response
+  so the plugin can tell the real relay from anything else on the port;
 * enforces the Mac-side policy (``allow_actions``, ``allow_save``,
-  ``allow_lua``, ``screenshot_enabled``) and the kill switch
-  (``tf3_relay.py pause``);
-* only forwards ops on its allowlist, with size and rate limits.
+  ``allow_lua``, ``screenshot_enabled``, ``screenshot_source``) and the kill
+  switch (``tf3_relay.py pause``), re-reading config.json when it changes,
+  and publishes the policy to the mod, which re-checks every request;
+* only forwards ops on its allowlist, with size, depth and rate limits.
 
 Stdlib only, Python 3.9+ (the version macOS Command Line Tools ships).
 
 Usage:
     tf3_relay.py init      # create config + token, detect the TF3 userdata folder
-    tf3_relay.py token     # print the bearer token for the VPS .env
+    tf3_relay.py token     # print the shared token for the VPS .env
     tf3_relay.py serve     # run the relay (the LaunchAgent does this)
     tf3_relay.py status    # local view: config, mod heartbeat, paused?
     tf3_relay.py pause     # kill switch: refuse every state-changing op
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import hmac
 import json
 import logging
@@ -68,13 +73,24 @@ ABANDONED_GRACE_S = 120.0
 RESULT_CACHE_SIZE = 256
 PART_CHARS = 60000
 MAX_OUTBOX_BYTES = 8 * 1024 * 1024
+MAX_ARGS_BYTES = 32 * 1024           # one request's serialized args
+MAX_PENDING_ARGS_BYTES = 512 * 1024  # all pending args together (the mod decodes the inbox in a frame)
+MAX_JSON_DEPTH = 32
+SIGNATURE_WINDOW_S = 60
+NONCE_TTL_S = 2 * SIGNATURE_WINDOW_S
+MAX_NONCES = 20000
+SCREENSHOT_MIN_INTERVAL_S = 2.0
+MAX_CONNECTIONS = 32
+SOCKET_TIMEOUT_S = 15
 
 log = logging.getLogger("tf3_relay")
 
 # Op allowlist, by class. Anything not listed is rejected before it reaches
 # the game. Keep in sync with hermes_bridge/content/hermes_bridge/ops.lua.
 READ_OPS = frozenset({"hello", "ping", "selftest", "snapshot", "get_entity", "list_vehicle_models"})
-VIEW_OPS = frozenset({"camera_focus", "take_screenshot"})
+VIEW_OPS = frozenset({"camera_focus"})
+# Ops the relay itself issues (never accepted on /v1/call).
+INTERNAL_OPS = frozenset({"take_screenshot"})
 ACTION_OPS = frozenset({
     "set_speed",
     "line_create", "line_update", "line_delete",
@@ -96,6 +112,52 @@ class RelayError(Exception):
 
     def body(self) -> dict:
         return {"ok": False, "error": {"code": self.code, "message": self.message, "retryable": self.retryable}}
+
+
+# ---------------------------------------------------------------------------
+# Request / response signatures (PROTOCOL.md section A)
+# ---------------------------------------------------------------------------
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def request_signature(key: str, method: str, target: str, timestamp: str, nonce: str, body: bytes) -> str:
+    """HMAC-SHA256 over the canonical request; ``target`` is path plus query, as sent."""
+    canonical = "\n".join(["tf3-v1", method.upper(), target, timestamp, nonce, _sha256_hex(body)])
+    return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def response_signature(key: str, nonce: str, status: int, body: bytes) -> str:
+    canonical = "\n".join(["tf3-v1-resp", nonce, str(int(status)), _sha256_hex(body)])
+    return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+_NONCE_RE = re.compile(r"^[0-9a-f]{32,64}$")
+
+
+class NonceCache:
+    """Remembers recently accepted nonces so a captured request can not be replayed."""
+
+    def __init__(self, ttl_s: float = NONCE_TTL_S, max_size: int = MAX_NONCES,
+                 clock: Callable[[], float] = time.time):
+        self.ttl_s = ttl_s
+        self.max_size = max_size
+        self.clock = clock
+        self._seen: "OrderedDict[str, float]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add(self, nonce: str) -> bool:
+        """Record *nonce*; False if it was already used (a replay)."""
+        now = self.clock()
+        with self._lock:
+            while self._seen and (now - next(iter(self._seen.values())) > self.ttl_s
+                                  or len(self._seen) >= self.max_size):
+                self._seen.popitem(last=False)
+            if nonce in self._seen:
+                return False
+            self._seen[nonce] = now
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +192,10 @@ class Config:
         "allow_save": True,
         "allow_lua": False,
         "screenshot_enabled": True,
-        "screenshot_source": "auto",   # auto | game | screen
+        # game: the game renders it (default; nothing else on the Mac is
+        # visible). auto: game, else a capture of the whole display.
+        # screen: always the whole display. Requests may only narrow this.
+        "screenshot_source": "game",
         "screenshot_display": 1,
         "keep_game_screenshots": False,
         "rate_limit_per_s": 10,
@@ -393,8 +458,10 @@ def parse_parts_file(src: bytes) -> Optional[dict]:
     if not isinstance(parts, list) or not all(isinstance(p, bytes) for p in parts):
         return None
     try:
-        decoded = json.loads(b"".join(parts).decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+        # One stray non-UTF-8 byte (say a mod's Latin-1 name) must not wedge
+        # the channel, so undecodable bytes become U+FFFD.
+        decoded = json.loads(b"".join(parts).decode("utf-8", "replace"))
+    except ValueError:
         return None
     return decoded if isinstance(decoded, dict) else None
 
@@ -426,36 +493,46 @@ _INBOX_RE = re.compile(r"^" + re.escape(FILE_PREFIX) + r"in_(?P<stamp>\d+)\.lua$
 
 
 class _Pending:
-    __slots__ = ("request_id", "seq", "op", "args", "event", "result", "abandoned_at")
+    __slots__ = ("request_id", "seq", "op", "args", "stamp", "size", "event", "result", "abandoned_at")
 
-    def __init__(self, request_id: str, seq: int, op: str, args: dict):
+    def __init__(self, request_id: str, seq: int, op: str, args: dict, stamp: Optional[str], size: int):
         self.request_id = request_id
         self.seq = seq
         self.op = op
         self.args = args
+        self.stamp = stamp
+        self.size = size
         self.event = threading.Event()
         self.result: Optional[dict] = None
         self.abandoned_at: Optional[float] = None
+
+
+# Policy published to the mod when nothing better is known: reads only.
+FAIL_CLOSED_POLICY = {"paused": False, "allow_actions": False, "allow_save": False, "allow_lua": False}
 
 
 class ModChannel:
     """Relay side of the userdata file protocol (heightmaps folder).
 
     The mod announces itself by writing ``hermes_bridge__out_<stamp>_<k>``
-    files (a fresh name per write, k increasing) and creates its own empty
-    inbox ``hermes_bridge__in_<stamp>``. The relay discovers the newest stamp,
-    rewrites that inbox atomically with the pending requests, reads results
-    from the newest outbox, and deletes consumed outbox files.
+    files (a fresh name per write) and creates its own empty inbox
+    ``hermes_bridge__in_<stamp>``. The relay follows the newest outbox (by
+    mtime, then k), rewrites that stamp's inbox atomically with the pending
+    requests plus the current policy, and deletes consumed outbox files.
 
-    Requests carry the caller's request_id end to end: the mod's engine side
-    executes each id at most once, so re-sending pending requests after a game
-    reload (new stamp) or a relay restart (new session) is safe.
+    A new stamp means the game was (re)loaded. State-changing requests that
+    were still pending are then failed with ``game_reloaded`` instead of
+    being sent into the new game, where their entity ids mean something else;
+    reads are simply re-sent. Each request also carries the stamp it is meant
+    for, and the mod refuses any other.
     """
 
     def __init__(self, exchange_dir: Path, *, poll_s: float = 0.1,
+                 policy_fn: Optional[Callable[[], Dict[str, bool]]] = None,
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         self.dir = exchange_dir
         self.poll_s = poll_s
+        self.policy_fn = policy_fn or (lambda: dict(FAIL_CLOSED_POLICY))
         self._clock = clock
         self._wall = wall
         self.session = uuid.uuid4().hex
@@ -464,10 +541,12 @@ class ModChannel:
         self._pending: "OrderedDict[str, _Pending]" = OrderedDict()
         self._done: "OrderedDict[str, dict]" = OrderedDict()
         self._stamp: Optional[str] = None
-        self._last_k = -1
+        self._last_seen: Optional[Tuple[float, int]] = None
         self._outbox_mtime: Optional[float] = None
         self._mod_info: Dict[str, Any] = {}
         self._inbox_written_at = 0.0
+        self._published_policy: Optional[Dict[str, bool]] = None
+        self._oversize_warned: Optional[Tuple[float, int]] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -509,12 +588,20 @@ class ModChannel:
             by_stamp.setdefault(m.group("stamp"), []).append((int(m.group("k")), Path(entry.path), mtime))
         return by_stamp
 
-    def _cleanup(self, by_stamp: Dict[str, List[Tuple[int, Path, float]]], current: Optional[str], newest_k: int) -> None:
+    @staticmethod
+    def newest(by_stamp: Dict[str, List[Tuple[int, Path, float]]]) -> Tuple[str, int, Path, float]:
+        """The stamp and outbox the mod wrote most recently (mtime first, then k)."""
+        stamp = max(by_stamp, key=lambda s: max((m, k) for k, _, m in by_stamp[s]))
+        k, path, mtime = max(by_stamp[stamp], key=lambda f: (f[2], f[0]))
+        return stamp, k, path, mtime
+
+    def _cleanup(self, by_stamp: Dict[str, List[Tuple[int, Path, float]]], current: str,
+                 newest: Tuple[float, int]) -> None:
         now = self._wall()
         for stamp, files in by_stamp.items():
             for k, path, mtime in files:
                 stale_other = stamp != current and now - mtime > ABANDONED_GRACE_S
-                consumed = stamp == current and k < newest_k
+                consumed = stamp == current and (mtime, k) < newest
                 if stale_other or consumed:
                     try:
                         path.unlink()
@@ -531,18 +618,56 @@ class ModChannel:
 
     # -- inbox -------------------------------------------------------------
 
-    def _write_inbox_locked(self) -> None:
+    def _current_policy(self) -> Dict[str, bool]:
+        try:
+            pol = self.policy_fn()
+        except Exception:
+            log.exception("policy lookup failed; publishing fail-closed policy")
+            pol = FAIL_CLOSED_POLICY
+        return {key: bool(pol.get(key)) for key in FAIL_CLOSED_POLICY}
+
+    def _write_inbox_locked(self, policy: Optional[Dict[str, bool]] = None) -> None:
         if self._stamp is None:
             return
+        policy = policy or self._current_policy()
         payload = {
             "v": PROTOCOL_VERSION,
             "session": self.session,
             "relay_t": int(self._wall()),
-            "requests": [{"id": p.request_id, "seq": p.seq, "op": p.op, "args": p.args}
+            "policy": policy,
+            "requests": [{"id": p.request_id, "seq": p.seq, "op": p.op, "args": p.args, "stamp": p.stamp}
                          for p in self._pending.values()],
         }
         atomic_write_bytes(self.dir / f"{FILE_PREFIX}in_{self._stamp}.lua", render_parts_file(payload))
         self._inbox_written_at = self._clock()
+        self._published_policy = policy
+
+    def _finish_locked(self, pending: _Pending, final: dict) -> None:
+        pending.result = final
+        self._remember_locked(pending.request_id, final)
+        pending.event.set()
+
+    def _adopt_stamp_locked(self, stamp: str) -> None:
+        log.info("mod announced stamp %s (game load)", stamp)
+        previous = self._stamp
+        if previous is not None:
+            # Leave nothing actionable in the old load's inbox.
+            try:
+                atomic_write_bytes(self.dir / f"{FILE_PREFIX}in_{previous}.lua", render_parts_file({
+                    "v": PROTOCOL_VERSION, "session": self.session, "relay_t": int(self._wall()),
+                    "policy": dict(FAIL_CLOSED_POLICY), "requests": []}))
+            except OSError:
+                log.warning("could not clear the previous inbox %s", previous)
+        self._stamp, self._last_seen = stamp, None
+        for rid, p in list(self._pending.items()):
+            if p.op in READ_OPS or p.op in VIEW_OPS or p.op in INTERNAL_OPS:
+                p.stamp = stamp  # harmless to answer from the new game
+                continue
+            self._pending.pop(rid)
+            self._finish_locked(p, {"ok": False, "result": None, "error": {
+                "code": "game_reloaded", "retryable": False,
+                "message": "the game was reloaded before this action was confirmed; it may have run in the "
+                           "previous game and was not repeated in this one. Re-observe."}})
 
     # -- outbox ------------------------------------------------------------
 
@@ -551,29 +676,36 @@ class ModChannel:
         changed = False
         with self._lock:
             if by_stamp:
-                stamp = max(by_stamp, key=lambda s: max(m for _, _, m in by_stamp[s]))
-                k, path, mtime = max(by_stamp[stamp])
+                stamp, k, path, mtime = self.newest(by_stamp)
                 if stamp != self._stamp:
-                    log.info("mod announced stamp %s (game load)", stamp)
-                    self._stamp, self._last_k = stamp, -1
-                    changed = True  # re-send everything pending into the new inbox
-                if k != self._last_k:
+                    self._adopt_stamp_locked(stamp)
+                    changed = True
+                if (mtime, k) != self._last_seen:
                     outbox = None
                     try:
-                        if path.stat().st_size <= MAX_OUTBOX_BYTES:
+                        size = path.stat().st_size
+                        if size <= MAX_OUTBOX_BYTES:
                             outbox = parse_parts_file(path.read_bytes())
+                        elif self._oversize_warned != (mtime, k):
+                            self._oversize_warned = (mtime, k)
+                            log.warning("outbox %s is %d bytes (limit %d); skipping it", path.name, size,
+                                        MAX_OUTBOX_BYTES)
+                            self._outbox_mtime = mtime  # the mod is alive, just over budget
                     except OSError:
                         outbox = None
                     if outbox is not None:
-                        self._last_k = k
+                        self._last_seen = (mtime, k)
                         self._outbox_mtime = mtime
                         changed = self._absorb_locked(outbox) or changed
-                        self._cleanup(by_stamp, stamp, k)
+                        self._cleanup(by_stamp, stamp, (mtime, k))
                 else:
                     self._outbox_mtime = mtime
             changed = self._expire_abandoned_locked() or changed
+            policy = self._current_policy()
+            if policy != self._published_policy:
+                changed = True  # e.g. `tf3_relay.py pause`: tell the mod right away
             if changed or (self._stamp and self._clock() - self._inbox_written_at >= RELAY_HEARTBEAT_S):
-                self._write_inbox_locked()
+                self._write_inbox_locked(policy)
 
     def _absorb_locked(self, outbox: dict) -> bool:
         self._mod_info = {k: outbox.get(k) for k in ("mod_version", "stamp", "transport", "status", "frame")}
@@ -586,10 +718,8 @@ class ModChannel:
             pending = self._pending.pop(str(res.get("id")), None)
             if pending is None:
                 continue
-            final = {"ok": bool(res.get("ok")), "result": res.get("result"), "error": res.get("error")}
-            pending.result = final
-            self._remember_locked(pending.request_id, final)
-            pending.event.set()
+            self._finish_locked(pending, {"ok": bool(res.get("ok")), "result": res.get("result"),
+                                          "error": res.get("error")})
             changed = True
         return changed
 
@@ -624,6 +754,7 @@ class ModChannel:
         return info
 
     def call(self, op: str, args: dict, request_id: str, timeout_s: float) -> dict:
+        size = len(json.dumps(args, ensure_ascii=True, separators=(",", ":")))
         with self._lock:
             if request_id in self._done:
                 return self._done[request_id]
@@ -631,14 +762,23 @@ class ModChannel:
             if pending is None:
                 if len(self._pending) >= MAX_PENDING:
                     raise RelayError(429, "too_many_pending", "too many requests waiting on the game", retryable=True)
+                if sum(p.size for p in self._pending.values()) + size > MAX_PENDING_ARGS_BYTES:
+                    raise RelayError(429, "too_much_pending", "too much request data waiting on the game",
+                                     retryable=True)
                 if not self.connected():
                     raise RelayError(503, "mod_not_connected",
                                      "the Hermes Bridge mod is not answering: start TF3 and load a save with the "
                                      "mod enabled (it stays silent in the main menu)", retryable=True)
                 self._seq += 1
-                pending = _Pending(request_id, self._seq, op, args)
+                pending = _Pending(request_id, self._seq, op, args, self._stamp, size)
                 self._pending[request_id] = pending
-                self._write_inbox_locked()
+                try:
+                    self._write_inbox_locked()
+                except OSError as exc:
+                    # Not queued anywhere the mod can see: report a clean "not sent".
+                    self._pending.pop(request_id, None)
+                    raise RelayError(503, "relay_io_error", f"could not write the exchange file: {exc}",
+                                     retryable=True)
             pending.abandoned_at = None
         if not pending.event.wait(timeout_s):
             with self._lock:
@@ -761,28 +901,117 @@ class RateLimiter:
             return True
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _json_depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > limit:
+            return False
+        if isinstance(item, dict):
+            stack.extend((v, depth + 1) for v in item.values())
+        elif isinstance(item, list):
+            stack.extend((v, depth + 1) for v in item)
+    return True
+
+
+def parse_request_json(raw: bytes) -> Any:
+    """Strict JSON for request bodies: no NaN/Infinity, bounded nesting."""
+    try:
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError):
+        raise RelayError(400, "invalid_request", "body is not valid JSON")
+    if not _json_depth_ok(body):
+        raise RelayError(400, "invalid_request", f"body nests deeper than {MAX_JSON_DEPTH} levels")
+    return body
+
+
 class Relay:
     def __init__(self, config: Config, channel: ModChannel, *,
                  screen_fn: Callable[..., Tuple[bytes, int, int]] = capture_screen,
                  convert_fn: Callable[..., Tuple[bytes, int, int]] = to_jpeg,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 wall: Callable[[], float] = time.time):
         self.config = config
         self.channel = channel
         self.screen_fn = screen_fn
         self.convert_fn = convert_fn
         self.sleep = sleep
+        self.wall = wall
         self.limiter = RateLimiter(float(config.data.get("rate_limit_per_s") or 10))
+        self.nonces = NonceCache(clock=wall)
         self.started = time.time()
         self._shot_lock = threading.Lock()
+        self._last_shot = 0.0
+        self._config_sig = self._stat_config()
+        self._config_checked = time.monotonic()
+        self._config_lock = threading.Lock()
+        channel.policy_fn = self.mod_policy
 
-    def authorized(self, header: Optional[str]) -> bool:
-        if not header or not header.startswith("Bearer "):
-            return False
-        presented = header[len("Bearer "):].strip().encode("utf-8")
-        expected = self.config.token.encode("utf-8")
-        return bool(expected) and hmac.compare_digest(presented, expected)
+    # -- config ------------------------------------------------------------
+
+    def _stat_config(self) -> Optional[Tuple[int, int]]:
+        try:
+            st = self.config.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def refresh_config(self, *, force: bool = False) -> None:
+        """Pick up config.json edits (token rotation, policy flags) without a restart."""
+        now = time.monotonic()
+        with self._config_lock:
+            if not force and now - self._config_checked < 1.0:
+                return
+            self._config_checked = now
+            sig = self._stat_config()
+            if sig is None or sig == self._config_sig:
+                return
+            try:
+                fresh = Config.load(self.config.home)
+            except (SystemExit, ValueError, OSError) as exc:
+                log.error("config.json changed but could not be loaded (%s); keeping the previous config", exc)
+                self._config_sig = sig
+                return
+            self._config_sig = sig
+            old_rate = self.config.data.get("rate_limit_per_s")
+            self.config = fresh
+            if fresh.data.get("rate_limit_per_s") != old_rate:
+                self.limiter = RateLimiter(float(fresh.data.get("rate_limit_per_s") or 10))
+            log.info("reloaded %s", fresh.path)
+
+    # -- auth --------------------------------------------------------------
+
+    def verify_request(self, method: str, target: str, headers: Any, body: bytes) -> str:
+        """Check the request signature; return its nonce, or raise 401."""
+        self.refresh_config()
+        ts = (headers.get("X-TF3-Timestamp") or "").strip()
+        nonce = (headers.get("X-TF3-Nonce") or "").strip().lower()
+        presented = (headers.get("X-TF3-Signature") or "").strip().lower()
+        key = self.config.token
+        if not (key and ts.isdigit() and _NONCE_RE.match(nonce) and presented):
+            raise RelayError(401, "unauthorized", "missing or malformed request signature")
+        expected = request_signature(key, method, target, ts, nonce, body)
+        if not hmac.compare_digest(presented.encode("ascii", "replace"), expected.encode("ascii")):
+            raise RelayError(401, "unauthorized", "bad request signature (wrong TF3_BRIDGE_TOKEN?)")
+        if abs(self.wall() - int(ts)) > SIGNATURE_WINDOW_S:
+            raise RelayError(401, "stale_request", "request timestamp is outside the allowed window (check clocks)")
+        if not self.nonces.add(nonce):
+            raise RelayError(401, "replayed_request", "this request was already used")
+        return nonce
+
+    def sign_response(self, nonce: Optional[str], status: int, body: bytes) -> Optional[str]:
+        if not nonce or not _NONCE_RE.match(nonce) or not self.config.token:
+            return None
+        return response_signature(self.config.token, nonce, status, body)
+
+    # -- policy ------------------------------------------------------------
 
     def policy(self) -> dict:
+        self.refresh_config()
         d = self.config.data
         return {
             "paused": self.config.is_paused(),
@@ -790,7 +1019,16 @@ class Relay:
             "allow_save": bool(d.get("allow_save")),
             "allow_lua": bool(d.get("allow_lua")),
             "screenshot_enabled": bool(d.get("screenshot_enabled")),
+            "screenshot_source": self.screenshot_ceiling(),
         }
+
+    def mod_policy(self) -> Dict[str, bool]:
+        pol = self.policy()
+        return {key: pol[key] for key in FAIL_CLOSED_POLICY}
+
+    def screenshot_ceiling(self) -> str:
+        source = str(self.config.data.get("screenshot_source") or "game")
+        return source if source in {"game", "auto", "screen"} else "game"
 
     def health(self) -> dict:
         mod = self.channel.mod_info()
@@ -838,6 +1076,8 @@ class Relay:
             raise RelayError(400, "invalid_request", "op must be a string and args an object")
         if not (1 <= len(request_id) <= 64) or not all(c.isalnum() or c in "-_" for c in request_id):
             raise RelayError(400, "invalid_request", "request_id must be 1-64 chars of [A-Za-z0-9_-]")
+        if len(json.dumps(args, ensure_ascii=True, separators=(",", ":"))) > MAX_ARGS_BYTES:
+            raise RelayError(413, "args_too_large", f"args must serialize to at most {MAX_ARGS_BYTES} bytes")
         try:
             timeout_s = float(body.get("timeout_s") or 30)
         except (TypeError, ValueError):
@@ -852,12 +1092,23 @@ class Relay:
                 "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
     def screenshot(self, query: Dict[str, List[str]]) -> Tuple[bytes, int, int, str]:
-        """Return (jpeg, width, height, source). Prefers the game's own renderer
-        (no macOS permission needed), falling back to screencapture."""
-        if not self.config.data.get("screenshot_enabled"):
+        """Return (jpeg, width, height, source).
+
+        The Mac config's screenshot_source is a ceiling: by default only the
+        game's own renderer is used, so nothing else on the user's screen can
+        leave the Mac. A request may narrow the source, never widen it.
+        """
+        pol = self.policy()
+        if not pol["screenshot_enabled"]:
             raise RelayError(403, "policy_denied", "screenshots are disabled in the Mac relay config")
-        if not self.limiter.allow():
-            raise RelayError(429, "rate_limited", "too many requests", retryable=True)
+        ceiling = pol["screenshot_source"]
+        source = (query.get("source") or [ceiling])[0]
+        if source not in {"auto", "game", "screen"}:
+            raise RelayError(400, "invalid_request", "source must be auto, game or screen")
+        if source != "game" and ceiling == "game":
+            raise RelayError(403, "policy_denied", "only in-game screenshots are allowed (screenshot_source: game)")
+        if source == "screen" and ceiling == "auto":
+            source = "auto"  # auto still prefers the game
 
         def _q(name: str, default: int, lo: int, hi: int) -> int:
             try:
@@ -866,10 +1117,11 @@ class Relay:
                 return default
 
         max_width, quality = _q("max_width", 1600, 320, 3840), _q("quality", 70, 30, 95)
-        source = (query.get("source") or [str(self.config.data.get("screenshot_source") or "auto")])[0]
-        if source not in {"auto", "game", "screen"}:
-            raise RelayError(400, "invalid_request", "source must be auto, game or screen")
         with self._shot_lock:
+            now = time.monotonic()
+            if now - self._last_shot < SCREENSHOT_MIN_INTERVAL_S:
+                raise RelayError(429, "rate_limited", "one screenshot every 2 s at most", retryable=True)
+            self._last_shot = now
             if source in {"auto", "game"} and self.channel.connected():
                 try:
                     return (*self._game_screenshot(max_width, quality), "game")
@@ -921,33 +1173,51 @@ def make_handler(relay: Relay):
     class Handler(BaseHTTPRequestHandler):
         server_version = "tf3-relay/" + RELAY_VERSION
         sys_version = ""
+        timeout = SOCKET_TIMEOUT_S  # a stalled client must not pin a thread
+        _nonce: Optional[str] = None
 
-        def log_message(self, fmt: str, *args: Any) -> None:  # never log headers (token)
+        def log_message(self, fmt: str, *args: Any) -> None:  # never log headers
             log.info("%s %s", self.address_string(), fmt % args)
+
+        def _send(self, status: int, body: bytes, content_type: str, extra: Optional[Dict[str, str]] = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for name, value in (extra or {}).items():
+                self.send_header(name, value)
+            signature = relay.sign_response(self._nonce, status, body)
+            if signature:
+                self.send_header("X-TF3-Response-Signature", signature)
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send_json(self, status: int, payload: dict) -> None:
             data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+            self._send(status, data, "application/json; charset=utf-8")
 
-        def _guard(self) -> bool:
+        def _host_ok(self) -> bool:
             host = (self.headers.get("Host") or "").strip().lower()
             if not host.endswith("]"):
                 host = host.rsplit(":", 1)[0]
             if host not in allowed_hosts:
                 self._send_json(421, RelayError(421, "bad_host", "unexpected Host header").body())
                 return False
-            if not relay.authorized(self.headers.get("Authorization")):
-                self._send_json(401, RelayError(401, "unauthorized", "missing or invalid bearer token").body())
+            return True
+
+        def _authenticate(self, body: bytes) -> bool:
+            # Sign the 401 too when the caller sent a well-formed nonce, so a
+            # plugin with the right token can tell "rejected" from "impostor".
+            self._nonce = (self.headers.get("X-TF3-Nonce") or "").strip().lower() or None
+            try:
+                relay.verify_request(self.command, self.path, self.headers, body)
+            except RelayError as exc:
+                self._send_json(exc.status, exc.body())
                 return False
             return True
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
-            if not self._guard():
+            if not self._host_ok() or not self._authenticate(b""):
                 return
             url = urlsplit(self.path)
             try:
@@ -955,15 +1225,9 @@ def make_handler(relay: Relay):
                     self._send_json(200, relay.health())
                 elif url.path == "/v1/screenshot":
                     data, width, height, source = relay.screenshot(parse_qs(url.query))
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/jpeg")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("X-Image-Width", str(width))
-                    self.send_header("X-Image-Height", str(height))
-                    self.send_header("X-Image-Source", source)
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self._send(200, data, "image/jpeg", {"X-Image-Width": str(width),
+                                                         "X-Image-Height": str(height),
+                                                         "X-Image-Source": source})
                 else:
                     self._send_json(404, RelayError(404, "not_found", "no such endpoint").body())
             except RelayError as exc:
@@ -973,23 +1237,24 @@ def make_handler(relay: Relay):
                 self._send_json(500, RelayError(500, "internal", "relay error (see relay log)").body())
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._guard():
+            if not self._host_ok():
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                length = -1
+            if length <= 0 or length > MAX_BODY_BYTES:
+                self._send_json(413, RelayError(413, "body_too_large",
+                                                f"body must be 1..{MAX_BODY_BYTES} bytes").body())
+                return
+            raw = self.rfile.read(length)
+            if not self._authenticate(raw):
                 return
             url = urlsplit(self.path)
             try:
                 if url.path != "/v1/call":
                     raise RelayError(404, "not_found", "no such endpoint")
-                try:
-                    length = int(self.headers.get("Content-Length") or "0")
-                except ValueError:
-                    raise RelayError(400, "invalid_request", "bad Content-Length")
-                if length <= 0 or length > MAX_BODY_BYTES:
-                    raise RelayError(413, "body_too_large", f"body must be 1..{MAX_BODY_BYTES} bytes")
-                try:
-                    body = json.loads(self.rfile.read(length).decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
-                    raise RelayError(400, "invalid_request", "body is not valid JSON")
-                self._send_json(200, relay.call(body))
+                self._send_json(200, relay.call(parse_request_json(raw)))
             except RelayError as exc:
                 self._send_json(exc.status, exc.body())
             except Exception:
@@ -1002,6 +1267,28 @@ def make_handler(relay: Relay):
 class RelayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Bound concurrent connections so idle sockets can not exhaust threads
+        # or file descriptors; excess connections are closed straight away.
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def build_server(relay: Relay, port: Optional[int] = None) -> RelayServer:
@@ -1052,7 +1339,8 @@ def cmd_token(args: argparse.Namespace) -> int:
 def cmd_pause(args: argparse.Namespace) -> int:
     cfg = Config.load()
     cfg.paused_flag.write_text(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n", encoding="utf-8")
-    print("paused: the relay now refuses every state-changing op (reads and screenshots still work)")
+    print("paused: the relay and the mod now refuse every state-changing op, including ones already "
+          "queued (reads and screenshots still work)")
     return 0
 
 
@@ -1091,8 +1379,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = Config.load()
     channel = ModChannel(cfg.exchange_dir)
+    relay = Relay(cfg, channel)  # publishes the Mac policy to the mod through the channel
     channel.start()
-    relay = Relay(cfg, channel)
     server = build_server(relay)
     log.info("tf3 relay %s listening on 127.0.0.1:%d, exchange folder %s", RELAY_VERSION, cfg.port, cfg.exchange_dir)
     try:
@@ -1113,7 +1401,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_init.add_argument("--port", type=int, help=f"loopback port (default {DEFAULT_PORT})")
     p_init.add_argument("--rotate-token", action="store_true", help="generate a new token")
     p_init.set_defaults(func=cmd_init)
-    sub.add_parser("token", help="print the bearer token").set_defaults(func=cmd_token)
+    sub.add_parser("token", help="print the shared token (HMAC key)").set_defaults(func=cmd_token)
     p_serve = sub.add_parser("serve", help="run the relay")
     p_serve.add_argument("-v", "--verbose", action="store_true")
     p_serve.set_defaults(func=cmd_serve)

@@ -6,19 +6,25 @@
 --     GUI Lua has no io library, and since build 40420 saveUserdata only
 --     accepts heightmaps, mod_presets and towns_industries. heightmaps is the
 --     one no in-game list shows (the map editor lists only images there);
+--   * enforces the Mac-side policy the relay publishes in every inbox
+--     (kill switch, allow_actions/allow_save/allow_lua), so a request that
+--     was queued before the user paused automation is refused, not run;
 --   * runs reads, camera, screenshots, saving and lua_eval itself;
---   * forwards state-changing ops to the engine state as a script event and
---     collects their results from the game-script state.
--- Engine state (engine_handle_event): executes forwarded ops exactly once per
--- request id and records the result in the game-script state.
+--   * forwards state-changing ops to the engine state as a script event with
+--     an absolute deadline, and collects their results from the game-script
+--     state.
+-- Engine state (engine_handle_event): executes a forwarded op at most once
+-- per request id, and never after its deadline, so a command stuck behind a
+-- paused or stalled simulation can not surprise anyone later.
 --
 -- Files (PROTOCOL.md section B) in <userdata>/heightmaps/, all Lua tables
 -- {v=1, parts={json chunks}}:
 --   hermes_bridge__in_<stamp>       relay -> mod, rewritten by the relay
 --   hermes_bridge__out_<stamp>_<k>  mod -> relay, a fresh name per write
--- <stamp> is chosen per game load and kept in guiState, so a recreated GUI
--- Lua state reuses it. Only fresh names are ever written by the mod, which
--- sidesteps reported saveUserdata overwrite/caching quirks.
+-- <stamp> is fresh every time this Lua state initialises (in practice: every
+-- game load). Only fresh names are ever written by the mod, which sidesteps
+-- reported saveUserdata overwrite/caching quirks, and requests carry the
+-- stamp they were queued for so nothing crosses from one game into another.
 --
 -- Loaded by hermes_bridge.script.lua as a factory: bridge(json, util, ops).
 
@@ -36,11 +42,22 @@ local BUSY_POLL_FRAMES = 6         -- ~100 ms at 60 fps while requests are in fl
 local IDLE_POLL_FRAMES = 15        -- ~250 ms otherwise
 local HEARTBEAT_S = 3              -- outbox heartbeat while the relay is alive
 local RELAY_ALIVE_S = 30           -- relay counts as alive this long after an inbox change
-local ENGINE_TIMEOUT_S = 90        -- forwarded op gave no result (simulation paused?)
+local ENGINE_DEADLINE_S = 75       -- a forwarded op must start within this, or it never runs
+local ENGINE_GRACE_S = 5           -- then the GUI reports the (definitive) timeout
 local RETRY_INIT_FRAMES = 600      -- retry setup every ~10 s after a failure
 local MAX_DISPATCH_PER_POLL = 4
 local MAX_ENGINE_RESULTS = 40
-local MAX_RESULT_CHARS = 700000
+local MAX_RESULT_CHARS = 512 * 1024
+local MAX_INBOX_CHARS = 1024 * 1024
+local OUTBOX_BUDGET_CHARS = 2 * 1024 * 1024  -- hold new work while this much awaits the relay
+
+-- Request classes, mirroring the relay's allowlist. Reads and view ops run
+-- regardless of policy; everything else is a state change.
+local READ_OPS = { hello = true, ping = true, selftest = true, snapshot = true, get_entity = true,
+                   list_vehicle_models = true }
+local VIEW_OPS = { camera_focus = true, take_screenshot = true }
+local SAVE_OPS = { save_game = true }
+local LUA_OPS = { lua_eval = true }
 
 M.EVENT_ID, M.EVENT_NAME, M.PREFIX, M.DIR = EVENT_ID, EVENT_NAME, PREFIX, DIR
 M.GS_NAME = 'hermes_bridge::/hermes_bridge/hermes_bridge.gs'
@@ -64,6 +81,7 @@ local function reset()
   S.next_poll = 0
   S.next_heartbeat_t = 0
   S.inbox_text = nil
+  S.inbox = nil
   S.relay_seen_t = nil
   S.session = nil
   S.seen = {}
@@ -107,9 +125,11 @@ end
 
 local function from_parts(tbl)
   if type(tbl) ~= 'table' or tbl.v ~= PROTOCOL or type(tbl.parts) ~= 'table' then return nil end
-  local chunks = {}
+  local chunks, size = {}, 0
   for i = 1, #tbl.parts do
     if type(tbl.parts[i]) ~= 'string' then return nil end
+    size = size + #tbl.parts[i]
+    if size > MAX_INBOX_CHARS then return nil, 'too_large' end
     chunks[i] = tbl.parts[i]
   end
   return table.concat(chunks)
@@ -121,7 +141,7 @@ local function outbox_name(k) return PREFIX .. 'out_' .. S.stamp .. '_' .. k end
 -- Results ---------------------------------------------------------------------
 
 local function record(id, seq, op)
-  local rec = { id = id, seq = seq, op = op, status = 'pending' }
+  local rec = { id = id, seq = seq, op = op, status = 'pending', size = 0 }
   S.results[id] = rec
   S.order[#S.order + 1] = id
   return rec
@@ -131,7 +151,8 @@ local function complete(rec, ok, payload)
   if rec.status == 'done' then return end
   rec.status = 'done'
   rec.ok = ok and true or false
-  rec.forwarded, rec.sent_t = nil, nil
+  rec.forwarded, rec.deadline = nil, nil
+  rec.size = 200
   if ok then
     local enc_ok, encoded = pcall(json.encode, payload)
     if not enc_ok then
@@ -142,6 +163,7 @@ local function complete(rec, ok, payload)
       rec.error = { code = 'result_too_large', message = 'result too large; request fewer items (limit)' }
     else
       rec.result = payload
+      rec.size = #encoded
     end
   else
     rec.error = payload
@@ -160,6 +182,15 @@ local function prune(live)
     end
   end
   S.order = kept
+end
+
+local function waiting_chars()
+  local total = 0
+  for _, id in ipairs(S.order) do
+    local rec = S.results[id]
+    if rec and rec.status == 'done' then total = total + (rec.size or 0) end
+  end
+  return total
 end
 
 local function write_outbox()
@@ -191,47 +222,53 @@ end
 
 -- Setup -------------------------------------------------------------------------
 
+-- A stamp unique to this Lua state: wall clock plus a random part seeded
+-- from several clocks, so two inits in the same second still differ.
 local function new_stamp()
   local t = util.try(util.path(os, 'time')) or 0
-  local r = math.random(0, 999999)
-  return string.format('%d%06d', t, r)
+  local c = util.try(util.path(os, 'clock')) or 0
+  local a = util.try(util.path(api, 'util.getApplicationTime')) or 0
+  pcall(math.randomseed, (t % 1000000) + math.floor((c * 7919 + a * 104729) % 1000000) + S.frame)
+  return string.format('%d%06d', t, math.random(0, 999999))
 end
 
-local function init(gui_state)
-  local persisted = gui_state and util.try(function() return gui_state:get() end)
-  local stamp = type(persisted) == 'table' and persisted.hermes_bridge_stamp or nil
-  local fresh = stamp == nil
-  if fresh then
-    pcall(math.randomseed, (util.try(util.path(os, 'time')) or 0) + S.frame)
-    stamp = new_stamp()
-  end
-  S.stamp = stamp
+local function init()
+  S.stamp = new_stamp()
   -- The inbox must exist before we poll it (loading a missing userdata file
   -- logs an error in the game log), so the mod creates it empty itself.
-  if fresh then
-    local ok, err = save(inbox_name(), { v = PROTOCOL, parts = {} })
-    if not ok then
-      S.stamp = nil
-      S.status = 'cannot write ' .. DIR .. ': ' .. tostring(err)
-      return false
-    end
-    if gui_state then
-      local merged = {}
-      if type(persisted) == 'table' then for k, v in pairs(persisted) do merged[k] = v end end
-      merged.hermes_bridge_stamp = stamp
-      pcall(function() gui_state:set(merged) end)
-    end
+  local ok, err = save(inbox_name(), { v = PROTOCOL, parts = {} })
+  if not ok then
+    S.stamp = nil
+    S.status = 'cannot write ' .. DIR .. ': ' .. tostring(err)
+    return false
   end
   S.status = 'waiting for relay'
   write_outbox() -- doubles as the hello the relay discovers
   return true
 end
 
--- GUI loop ---------------------------------------------------------------------
+-- Policy ------------------------------------------------------------------------
+
+-- The relay is the authority; the mod re-checks every request against the
+-- policy in the inbox it arrived in, and fails closed without one.
+local function policy_denial(op, policy)
+  if READ_OPS[op] or VIEW_OPS[op] then return nil end
+  if type(policy) ~= 'table' then
+    return { code = 'policy_denied', message = 'no policy from the relay; refusing state changes' }
+  end
+  if policy.paused == true then
+    return { code = 'paused', message = 'automation is paused on the Mac; nothing was done' }
+  end
+  local flag = (LUA_OPS[op] and 'allow_lua') or (SAVE_OPS[op] and 'allow_save') or 'allow_actions'
+  if policy[flag] ~= true then
+    return { code = 'policy_denied', message = flag .. ' is off on the Mac; nothing was done' }
+  end
+  return nil
+end
 
 -- While the game is paused the simulation does not step, so a forwarded
--- command would sit in the queue and run whenever the player resumes —
--- long after the agent was told it timed out. Refuse it up front instead.
+-- command would only run whenever someone resumes the game. Refuse it up
+-- front; whether to unpause is the player's call, not the agent's.
 local function game_paused()
   local world = util.try(util.path(api, 'engine.util.getWorld'))
   local ct = util.path(api, 'type.ComponentType.GAME_SPEED')
@@ -241,10 +278,12 @@ local function game_paused()
   return gs ~= nil and util.try(function() return gs.speedup == 0 end) == true
 end
 
+-- GUI loop ---------------------------------------------------------------------
+
 local function forward(rec, op, args)
   if game_paused() then
     complete(rec, false, { code = 'game_paused', retryable = true,
-      message = 'the game is paused; nothing was done. Resume with set_speed {speedup: 1} first.' })
+      message = 'the game is paused, so nothing was done (commands only run while the simulation runs)' })
     return
   end
   local make = util.path(api, 'cmd.makeScriptingSendEventCmd')
@@ -253,55 +292,79 @@ local function forward(rec, op, args)
     complete(rec, false, { code = 'api_unavailable', message = 'script events are unavailable' })
     return
   end
-  local ok, err = pcall(sendCommand, make('', EVENT_ID, EVENT_NAME, { key = rec.id, op = op, args = args }))
+  local deadline = util.now(S.frame) + ENGINE_DEADLINE_S
+  local param = { key = rec.id, op = op, args = args, expires_at = deadline }
+  local ok, err = pcall(sendCommand, make('', EVENT_ID, EVENT_NAME, param))
   if not ok then
     complete(rec, false, { code = 'internal', message = 'could not forward to the simulation: ' .. tostring(err) })
     return
   end
   rec.forwarded = true
-  rec.sent_t = util.now(S.frame)
+  rec.deadline = deadline
 end
 
-local function poll()
-  local text = from_parts(load_table(inbox_name()))
-  if text == nil then return false end
+local function dispatch(rec, req, policy)
+  local args = type(req.args) == 'table' and req.args or {}
+  if req.stamp ~= S.stamp then
+    -- Queued for another game load; never run it against this one.
+    complete(rec, false, { code = 'stale_stamp', message = 'request was queued for a different game load' })
+    return
+  end
+  local denial = policy_denial(req.op, policy)
+  if denial then
+    complete(rec, false, denial)
+    return
+  end
+  if ops.ENGINE_OPS[req.op] and args.dry_run ~= true then
+    forward(rec, req.op, args)
+  else
+    ops.dispatch(req.op, args, function(ok, payload) complete(rec, ok, payload) end)
+  end
+end
+
+local function read_inbox()
+  local text, err = from_parts(load_table(inbox_name()))
+  if err == 'too_large' then S.status = 'inbox too large; ignoring it' end
+  if text == nil then return nil end
   if text ~= S.inbox_text then
     S.inbox_text = text
     S.relay_seen_t = util.now(S.frame)
+    S.inbox = nil
+    if text ~= '' then
+      local ok, inbox = pcall(json.decode, text)
+      if ok and type(inbox) == 'table' and inbox.v == PROTOCOL and type(inbox.session) == 'string' then
+        if type(inbox.requests) ~= 'table' then inbox.requests = {} end
+        table.sort(inbox.requests, function(a, b) return (tonumber(a.seq) or 0) < (tonumber(b.seq) or 0) end)
+        S.inbox = inbox
+      end
+    end
   end
-  if text == '' then return false end
-  local ok, inbox = pcall(json.decode, text)
-  if not ok or type(inbox) ~= 'table' or inbox.v ~= PROTOCOL or type(inbox.session) ~= 'string' then
-    return false
-  end
+  return S.inbox -- decoded once per change, not once per poll
+end
+
+local function poll()
+  local inbox = read_inbox()
+  if inbox == nil then return false end
   if inbox.session ~= S.session then
-    -- A new relay session restarts the request stream; engine-side results
-    -- are keyed by request id, so re-sent requests are not executed twice.
+    -- A new relay session restarts the request stream.
     S.session = inbox.session
     S.seen, S.results, S.order = {}, {}, {}
     S.dirty = true
   end
   S.status = 'connected'
-  local requests = type(inbox.requests) == 'table' and inbox.requests or {}
-  table.sort(requests, function(a, b) return (tonumber(a.seq) or 0) < (tonumber(b.seq) or 0) end)
   local live, dispatched, busy = {}, 0, false
-  for _, req in ipairs(requests) do
-    local id = req.id
+  local backlog = waiting_chars() > OUTBOX_BUDGET_CHARS
+  for _, req in ipairs(inbox.requests) do
+    local id = type(req) == 'table' and req.id or nil
     if type(id) == 'string' and type(req.op) == 'string' then
       live[id] = true
       if not S.seen[id] then
-        if dispatched >= MAX_DISPATCH_PER_POLL then
+        if dispatched >= MAX_DISPATCH_PER_POLL or backlog then
           busy = true
         else
           S.seen[id] = true
           dispatched = dispatched + 1
-          local args = type(req.args) == 'table' and req.args or {}
-          local rec = record(id, req.seq, req.op)
-          if ops.ENGINE_OPS[req.op] and args.dry_run ~= true then
-            forward(rec, req.op, args)
-          else
-            ops.dispatch(req.op, args, function(ok2, payload) complete(rec, ok2, payload) end)
-          end
+          dispatch(record(id, req.seq, req.op), req, inbox.policy)
           S.dirty = true
         end
       end
@@ -313,6 +376,19 @@ local function poll()
   return busy
 end
 
+local function engine_state(state_ro)
+  local st = state_ro and util.try(function() return state_ro:get() end)
+  if type(st) == 'table' then return st end
+  -- Fallback: read the game-script state straight from its GAME_SCRIPT component.
+  local find = util.path(api, 'engine.system.gameScriptSystem.getEntityForGameScript')
+  local entity = find and util.try(find, M.GS_NAME)
+  local exists = util.path(api, 'engine.entityExists')
+  if type(entity) ~= 'number' or (exists and util.try(exists, entity) ~= true) then return nil end
+  local ct = util.path(api, 'type.ComponentType.GAME_SCRIPT')
+  local comp = ct and util.try(api.engine.getComponent, entity, ct)
+  return comp and util.try(function() return comp.state end)
+end
+
 local function collect_engine_results(state_ro)
   local pending = false
   for _, id in ipairs(S.order) do
@@ -320,15 +396,7 @@ local function collect_engine_results(state_ro)
     if rec and rec.forwarded and rec.status == 'pending' then pending = true break end
   end
   if not pending then return end
-  local st = state_ro and util.try(function() return state_ro:get() end)
-  if type(st) ~= 'table' then
-    -- Fallback: read the game-script state straight from its GAME_SCRIPT component.
-    local find = util.path(api, 'engine.system.gameScriptSystem.getEntityForGameScript')
-    local entity = find and util.try(find, M.GS_NAME)
-    local ct = util.path(api, 'type.ComponentType.GAME_SCRIPT')
-    local comp = entity and ct and util.try(api.engine.getComponent, entity, ct)
-    st = comp and util.try(function() return comp.state end)
-  end
+  local st = engine_state(state_ro)
   local results = type(st) == 'table' and st.hermes_bridge_results or nil
   local now = util.now(S.frame)
   for _, id in ipairs(S.order) do
@@ -337,10 +405,11 @@ local function collect_engine_results(state_ro)
       local res = type(results) == 'table' and results[id] or nil
       if type(res) == 'table' and res.done then
         complete(rec, res.ok, res.ok and res.result or res.error)
-      elseif now - (rec.sent_t or now) > ENGINE_TIMEOUT_S then
-        complete(rec, false, { code = 'engine_timeout', retryable = false,
-          message = 'the simulation has not run the command yet; it is still queued and may run later. '
-            .. 'Re-observe before retrying so it is not done twice.' })
+      elseif now > (rec.deadline or now) + ENGINE_GRACE_S then
+        -- Past its deadline the engine refuses the command, so this is final.
+        complete(rec, false, { code = 'engine_timeout', retryable = true,
+          message = 'the simulation did not run the command in time; it has expired and will not run, '
+            .. 'so nothing was done' })
       end
     end
   end
@@ -351,7 +420,7 @@ function M.gui_tick(state_ro, gui_state)
   if S.stamp == nil then
     if S.frame < S.next_init then return end
     S.next_init = S.frame + RETRY_INIT_FRAMES
-    if not init(gui_state) then return end
+    if not init() then return end
   end
   if S.frame >= S.next_poll then
     local ok, busy = pcall(poll)
@@ -406,7 +475,12 @@ function M.engine_handle_event(state, src, id, name, param)
   if type(key) ~= 'string' then return end
   local st = util.try(function() return state:get() end)
   local seen = type(st) == 'table' and type(st.hermes_bridge_results) == 'table' and st.hermes_bridge_results[key]
-  if seen then return end -- already executed: exactly-once across reloads and re-sends
+  if seen then return end -- already executed: at most once per request id
+  if type(param.expires_at) ~= 'number' or util.now(0) > param.expires_at then
+    store_engine_result(state, key, false, { code = 'expired',
+      message = 'the command reached the simulation after its deadline and was not run' })
+    return
+  end
   if not ops.ENGINE_OPS[param.op] then
     store_engine_result(state, key, false, { code = 'unknown_op', message = 'not an engine op: ' .. tostring(param.op) })
     return

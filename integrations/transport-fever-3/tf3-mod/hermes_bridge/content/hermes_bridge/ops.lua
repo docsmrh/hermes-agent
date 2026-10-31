@@ -215,7 +215,8 @@ end
 
 function ops.camera_focus(args, finish)
   if args.entity_id ~= nil then
-    need_fn('gui.camera.focusEntity')(need_int(args, 'entity_id'))
+    -- Stale ids are common (sold vehicles, rebuilt stations): check first.
+    need_fn('gui.camera.focusEntity')(need_entity(args, 'entity_id'))
   else
     local distance = tonumber(args.distance) or 500
     need_fn('gui.camera.focusPosition')(vec3f(args.position, 'position'), distance)
@@ -224,7 +225,7 @@ function ops.camera_focus(args, finish)
 end
 
 function ops.take_screenshot(args, finish)
-  need_fn('gui.camera.takeScreenshot')(util.clamp_int(args.scale, 1, 4, 1))
+  need_fn('gui.camera.takeScreenshot')(util.clamp_int(args.scale, 1, 2, 1))
   finish(true, { requested = true, note = 'written to the userdata screenshot folder by the game' })
 end
 
@@ -241,33 +242,63 @@ function ops.set_speed(args, finish)
   send(cmd, finish, function() return { speedup = speedup } end)
 end
 
--- Resolve [{station_id=..}|{station_group_id=.., station_index=..}] into Line.Stop structs.
-local function build_stops(list)
-  if type(list) ~= 'table' or #list < 2 then
-    error({ code = 'invalid_argument', message = 'stops needs at least 2 entries' }, 0)
+local function invalid(message)
+  error({ code = 'invalid_argument', message = message }, 0)
+end
+
+local function non_negative_int(v, what)
+  local n = tonumber(v)
+  if n == nil or n % 1 ~= 0 or n < 0 then invalid(what .. ' must be a non-negative integer') end
+  return n
+end
+
+-- Stale station and platform indices are a reported native crash in the
+-- base game's line code, so every stop is checked against live entities.
+local function stop_terminal(station, s, i)
+  local terminal = non_negative_int(s.terminal == nil and 0 or s.terminal, 'stop ' .. i .. ' terminal')
+  local comp = snapshot.component(station, 'STATION')
+  local n = comp and #util.list(util.try(function() return comp.terminals end)) or 0
+  if n > 0 and terminal >= n then
+    invalid('stop ' .. i .. ': station ' .. station .. ' has terminals 0..' .. (n - 1))
   end
+  return terminal
+end
+
+-- Resolve [station_id | {station_id, terminal?} | {station_group_id, station_index, terminal?}]
+-- into Line.Stop structs.
+local function build_stops(list)
+  if type(list) ~= 'table' or #list < 2 then invalid('stops needs at least 2 entries') end
+  if #list > 100 then invalid('a line can have at most 100 stops here') end
   local sgs = util.path(api, 'engine.system.stationGroupSystem')
   local new_stop = need_fn('type.Line.Stop.new')
   local stops = {}
   for i, s in ipairs(list) do
     if type(s) == 'number' then s = { station_id = s } end
-    if type(s) ~= 'table' then error({ code = 'invalid_argument', message = 'stop ' .. i .. ' must be an object' }, 0) end
-    local group, index = s.station_group_id, s.station_index
+    if type(s) ~= 'table' then invalid('stop ' .. i .. ' must be a station id or an object') end
+    local group, index, station
     if s.station_id ~= nil then
-      local st = need_entity(s, 'station_id', 'STATION')
-      group = sgs and util.try(sgs.getStationGroup, st)
+      station = need_entity(s, 'station_id', 'STATION')
+      group = sgs and util.try(sgs.getStationGroup, station)
       local comp = group and snapshot.component(group, 'STATION_GROUP')
       for j, member in ipairs(util.list(comp and util.try(function() return comp.stations end))) do
-        if member == st then index = j - 1 end
+        if member == station then index = j - 1 end
       end
-    end
-    if group == nil or index == nil then
-      error({ code = 'invalid_argument', message = 'stop ' .. i .. ': could not resolve station group/index' }, 0)
+      if group == nil or index == nil then invalid('stop ' .. i .. ': could not resolve the station group') end
+    else
+      group = need_entity(s, 'station_group_id', 'STATION_GROUP')
+      local comp = snapshot.component(group, 'STATION_GROUP')
+      local members = util.list(comp and util.try(function() return comp.stations end))
+      index = non_negative_int(s.station_index == nil and 0 or s.station_index, 'stop ' .. i .. ' station_index')
+      if index >= #members then
+        invalid('stop ' .. i .. ': group ' .. group .. ' has station indices 0..' .. (#members - 1))
+      end
+      station = members[index + 1]
+      if not exists(station) then invalid('stop ' .. i .. ': that station no longer exists') end
     end
     local stop = new_stop()
     stop.stationGroup = group
     stop.station = index
-    stop.terminal = tonumber(s.terminal) or 0
+    stop.terminal = stop_terminal(station, s, i)
     stops[#stops + 1] = stop
   end
   return stops
@@ -368,9 +399,18 @@ function ops.vehicle_buy(args, finish)
   if type(parts_spec) ~= 'table' or #parts_spec == 0 or #parts_spec > 40 then
     return fail(finish, 'invalid_argument', 'model (or models: up to 40 parts for a train) is required')
   end
-  local parts = {}
+  local parts, price, year = {}, 0, current_year()
   for _, spec in ipairs(parts_spec) do
-    parts[#parts + 1] = make_part(model_id(spec))
+    local id = model_id(spec)
+    if type(spec) == 'string' then
+      local info = model_info(spec, year)
+      if info.available == false then
+        invalid('model ' .. spec .. ' is not available in ' .. tostring(year) .. ' (see model_search)')
+      end
+    end
+    local part_price = util.try(function() return util.path(api, 'res.modelRep.get')(id).metadata.cost.price end)
+    price = (price ~= nil and type(part_price) == 'number') and price + part_price or nil
+    parts[#parts + 1] = make_part(id)
   end
   local tvc = need_fn('type.TransportVehicleConfig.new')()
   tvc.vehicles = parts
@@ -378,7 +418,12 @@ function ops.vehicle_buy(args, finish)
   pcall(function() tvc.muFileNames = {} end)
   local line_id = args.line_id ~= nil and need_entity(args, 'line_id', 'LINE') or nil
   local cmd = need_fn('cmd.makeVehicleBuyCmd')(snapshot.player(), depot, tvc)
-  if dry(args, finish, { depot_id = depot, parts = #parts, line_id = line_id }) then return end
+  if args.dry_run == true then
+    -- cost (from model metadata) lets the plugin enforce its cash reserve.
+    finish(true, { dry_run = true, valid = true, cost = price,
+                   would = { depot_id = depot, parts = #parts, line_id = line_id } })
+    return
+  end
   send(cmd, function(ok, res)
     if not ok or line_id == nil or res.vehicle_id == nil then return finish(ok, res) end
     send(need_fn('cmd.makeVehicleSetLineCmd')(res.vehicle_id, line_id, 0), function(ok2, res2)
@@ -392,7 +437,11 @@ end
 function ops.vehicle_set_line(args, finish)
   local v = need_entity(args, 'vehicle_id', 'TRANSPORT_VEHICLE')
   local line_id = need_entity(args, 'line_id', 'LINE')
-  local cmd = need_fn('cmd.makeVehicleSetLineCmd')(v, line_id, util.clamp_int(args.stop_index, 0, 1000, 0))
+  local line_comp = snapshot.component(line_id, 'LINE')
+  local n = #util.list(line_comp and util.try(function() return line_comp.stops end))
+  local stop_index = non_negative_int(args.stop_index == nil and 0 or args.stop_index, 'stop_index')
+  if n > 0 and stop_index >= n then invalid('line ' .. line_id .. ' has stops 0..' .. (n - 1)) end
+  local cmd = need_fn('cmd.makeVehicleSetLineCmd')(v, line_id, stop_index)
   if dry(args, finish, { vehicle_id = v, line_id = line_id }) then return end
   send(cmd, finish)
 end
@@ -447,8 +496,9 @@ local function build_proposal(proposal, args, finish, description)
     local data = util.try(util.path(api, 'engine.util.proposal.makeProposalData'), proposal, nil)
     local errors = proposal_errors(data)
     local costs = data and util.try(function() return data.costs end)
+    local cost = type(costs) == 'number' and costs or nil
     finish(true, { dry_run = true, valid = data ~= nil and not (errors and errors.critical),
-                   errors = errors, costs = util.plain(costs), would = description })
+                   errors = errors, cost = cost, costs = util.plain(costs), would = description })
     return
   end
   -- (proposal, context, ignoreErrors, playerInitiated): the four-argument
@@ -519,11 +569,18 @@ function ops.bulldoze(args, finish)
   build_proposal(proposal, args, finish, { entity_id = id })
 end
 
+-- Agent saves live in their own namespace, so they can never overwrite one
+-- of the player's saves.
+local SAVE_PREFIX = 'hermes-'
+
 function ops.save_game(args, finish)
-  local name = type(args.name) == 'string' and args.name or 'hermes-autosave'
-  if not name:match('^[%w%-_ ]+$') or #name > 64 then
-    return fail(finish, 'invalid_argument', 'name may contain letters, digits, space, - and _ (max 64)')
+  local suffix = type(args.name) == 'string' and args.name or 'autosave'
+  if suffix:sub(1, #SAVE_PREFIX) == SAVE_PREFIX then suffix = suffix:sub(#SAVE_PREFIX + 1) end
+  if suffix == '' or #suffix > 48 or not suffix:match('^[%w_%-]+$') then
+    return fail(finish, 'invalid_argument', 'name may contain letters, digits, - and _ (max 48); '
+      .. 'it is saved as ' .. SAVE_PREFIX .. '<name>')
   end
+  local name = SAVE_PREFIX .. suffix
   local save = util.path(app, 'saveGame')
   if type(save) ~= 'function' then return fail(finish, 'api_unavailable', 'app.saveGame is not available') end
   if dry(args, finish, { name = name }) then return end

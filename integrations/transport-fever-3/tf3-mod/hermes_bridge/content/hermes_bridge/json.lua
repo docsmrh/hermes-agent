@@ -7,8 +7,10 @@
 -- NaN/inf become null.
 -- Cycles raise an error instead of recursing forever.
 --
--- decode(text) -> value. Strict RFC 8259 parser; JSON null becomes json.NULL
--- (a sentinel) so callers can tell "null" from "absent".
+-- decode(text) -> value. Strict RFC 8259 parser. An object member whose value
+-- is null is dropped (models often send null for "not given", and every
+-- caller here treats absent and null alike); null inside an array becomes the
+-- json.NULL sentinel so array lengths stay right.
 
 local json = {}
 
@@ -208,7 +210,7 @@ local function parse_object(str, pos, depth)
     if str:sub(i, i) ~= ':' then decode_error(str, i, "expected ':'") end
     local v
     v, i = parse_value(str, skip_ws(str, i + 1), depth + 1)
-    obj[k] = v
+    if v ~= json.NULL then obj[k] = v end
     i = skip_ws(str, i)
     local c = str:sub(i, i)
     if c == '}' then return obj, i + 1 end

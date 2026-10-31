@@ -241,6 +241,14 @@ def make_relay(tmp_path, channel=None, **overrides):
                    convert_fn=lambda p, **kw: (b"\xff\xd8game", 1600, 900), sleep=lambda s: None)
 
 
+def test_plugin_and_relay_sign_identically():
+    from tests.plugins.tf3.harness import load_plugin
+    client = load_plugin().client
+    args = ("k" * 43, "POST", "/v1/screenshot?max_width=800", "1700000000", "ab" * 16, b'{"x":1}')
+    assert client.request_signature(*args) == R.request_signature(*args)
+    assert client.response_signature("k" * 43, "ab" * 16, 422, b"{}") == R.response_signature("k" * 43, "ab" * 16, 422, b"{}")
+
+
 def test_policy_allowlist_and_kill_switch(tmp_path):
     relay = make_relay(tmp_path)
     with pytest.raises(R.RelayError) as exc:
@@ -286,32 +294,209 @@ def test_mod_errors_map_to_422(tmp_path):
     assert (exc.value.status, exc.value.code) == (422, "not_found")
 
 
-def test_screenshot_prefers_the_game(tmp_path):
-    relay = make_relay(tmp_path)
-    shots = tmp_path / "userdata" / "screenshots"
-    shots.mkdir(parents=True)
-
+def _shooting_channel(shots):
     class Shooting(StubChannel):
         def call(self, op, args, request_id, timeout_s):
             if op == "take_screenshot":
                 (shots / "shot.png").write_bytes(b"\x89PNG")
             return super().call(op, args, request_id, timeout_s)
+    return Shooting()
 
-    relay.channel = Shooting()
+
+def test_screenshot_is_game_only_by_default(tmp_path):
+    relay = make_relay(tmp_path)
+    shots = tmp_path / "userdata" / "screenshots"
+    shots.mkdir(parents=True)
+    relay.channel = _shooting_channel(shots)
     data, w, h, source = relay.screenshot({})
     assert (data, source) == (b"\xff\xd8game", "game")
     assert not (shots / "shot.png").exists()  # cleaned up by default
+    relay._last_shot = 0
+    with pytest.raises(R.RelayError) as exc:  # a caller can not widen the Mac-side ceiling
+        relay.screenshot({"source": ["screen"]})
+    assert exc.value.code == "policy_denied"
     relay.channel = StubChannel(connected=False)
-    assert relay.screenshot({})[3] == "screen"
+    relay._last_shot = 0
+    with pytest.raises(R.RelayError) as exc:  # and the mod being away never exposes the desktop
+        relay.screenshot({})
+    assert exc.value.code == "mod_not_connected"
+
+
+def test_desktop_capture_needs_mac_opt_in(tmp_path):
+    relay = make_relay(tmp_path, screenshot_source="auto")
+    relay.channel = StubChannel(connected=False)
+    assert relay.screenshot({})[3] == "screen"  # auto: game if possible, else the display
+    relay._last_shot = 0
+    shots = tmp_path / "userdata" / "screenshots"
+    shots.mkdir(parents=True)
+    relay.channel = _shooting_channel(shots)
+    assert relay.screenshot({"source": ["game"]})[3] == "game"  # narrowing is always allowed
+
+
+def test_screenshots_are_rate_limited(tmp_path):
+    relay = make_relay(tmp_path, screenshot_source="screen")
+    relay.screenshot({})
+    with pytest.raises(R.RelayError) as exc:
+        relay.screenshot({})
+    assert exc.value.status == 429
+
+
+def test_take_screenshot_is_internal_only(tmp_path):
+    with pytest.raises(R.RelayError) as exc:
+        make_relay(tmp_path).call({"op": "take_screenshot", "args": {"scale": 4}})
+    assert exc.value.code == "unknown_op"
+
+
+def test_request_size_and_shape_limits(tmp_path):
+    relay = make_relay(tmp_path)
+    with pytest.raises(R.RelayError) as exc:
+        relay.call({"op": "hello", "args": {"blob": "x" * (R.MAX_ARGS_BYTES + 1)}})
+    assert exc.value.status == 413
+    for raw in [b'{"op":"hello","args":{"x":NaN}}', b'{"op":"hello","args":{"x":Infinity}}',
+                b'{"op":"hello","args":' + b'[' * 40 + b']' * 40 + b'}']:
+        with pytest.raises(R.RelayError) as exc:
+            R.parse_request_json(raw)
+        assert exc.value.code == "invalid_request"
+
+
+def test_config_changes_apply_without_restart(tmp_path):
+    relay = make_relay(tmp_path)
+    assert relay.call({"op": "vehicle_stop", "args": {}})["ok"]
+    cfg = json.loads(relay.config.path.read_text())
+    cfg["allow_actions"] = False
+    cfg["token"] = "n" * 43  # rotated
+    relay.config.path.write_text(json.dumps(cfg))
+    relay.refresh_config(force=True)
+    with pytest.raises(R.RelayError) as exc:
+        relay.call({"op": "vehicle_stop", "args": {}})
+    assert exc.value.code == "policy_denied"
+    assert relay.config.token == "n" * 43
 
 
 # ---------------------------------------------------------------------------
-# HTTP surface
+# ModChannel: policy, stamps, robustness
+# ---------------------------------------------------------------------------
+
+def test_inbox_carries_policy_and_stamp_and_follows_pause(exchange):
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    policy = {"paused": False, "allow_actions": True, "allow_save": True, "allow_lua": False}
+    ch = R.ModChannel(exchange, policy_fn=lambda: dict(policy))
+    ch.poll_once()
+    inbox = sim.inbox()
+    assert inbox["policy"] == policy
+    policy["paused"] = True
+    ch.poll_once()  # the policy change is published right away, not at the next heartbeat
+    assert sim.inbox()["policy"]["paused"] is True
+
+
+def test_default_policy_fails_closed(exchange):
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+    assert sim.inbox()["policy"] == R.FAIL_CLOSED_POLICY
+
+
+def test_game_reload_fails_pending_actions_and_resends_reads(exchange):
+    old = SimMod(exchange, stamp="1700000000000001")
+    old.write_outbox()
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+    for op, rid in [("vehicle_sell", "act-1"), ("snapshot", "read-1")]:
+        with pytest.raises(R.RelayError):
+            ch.call(op, {}, rid, 1)
+    assert {r["stamp"] for r in old.inbox()["requests"]} == {old.stamp}
+    time.sleep(0.02)
+    new = SimMod(exchange, stamp="1700000000000002")
+    new.write_outbox()
+    ch.poll_once()
+    assert [(r["id"], r["stamp"]) for r in new.inbox()["requests"]] == [("read-1", new.stamp)]
+    assert old.inbox()["requests"] == []  # nothing left behind for the old load
+    res = ch.call("vehicle_sell", {}, "act-1", 1)
+    assert res["ok"] is False and res["error"]["code"] == "game_reloaded"
+
+
+def test_newest_outbox_wins_even_with_a_lower_k(exchange):
+    sim = SimMod(exchange)
+    sim.k = 40
+    sim.write_outbox()  # k=41
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+    time.sleep(0.02)
+    sim.k = 0  # the mod restarted its counter under the same stamp
+    sim.write_outbox(session=ch.session, results=[{"id": "z", "status": "done", "ok": True}])
+    ch.poll_once()
+    assert ch.connected()
+    assert ch._last_seen[1] == 1
+
+
+def test_bad_utf8_in_an_outbox_does_not_wedge_the_channel(exchange):
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            inbox = sim.inbox()
+            results = [{"id": r["id"], "seq": r["seq"], "status": "done", "ok": True, "result": {"name": "@@"}}
+                       for r in inbox.get("requests", [])]
+            sim.k += 1
+            text = json.dumps({"v": 1, "stamp": sim.stamp, "session": inbox.get("session", ""), "results": results})
+            raw = ("function data()\nreturn { k = %d, parts = { %s }, v = 1, }\nend" % (sim.k, _lua_str(text))).encode()
+            (exchange / f"hermes_bridge__out_{sim.stamp}_{sim.k}.lua").write_bytes(raw.replace(b"@@", b"\xe9t\xe9"))
+            ch.poll_once()
+            time.sleep(0.01)
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        res = ch.call("snapshot", {}, "latin1", 5)
+    finally:
+        stop.set()
+        t.join()
+    assert res["ok"] and "�" in res["result"]["name"]
+
+
+def test_failed_inbox_write_is_reported_as_not_sent(exchange, monkeypatch):
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+
+    def broken(path, data):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(R, "atomic_write_bytes", broken)
+    with pytest.raises(R.RelayError) as exc:
+        ch.call("vehicle_sell", {}, "io-1", 1)
+    assert (exc.value.status, exc.value.code, exc.value.retryable) == (503, "relay_io_error", True)
+    assert ch.mod_info()["pending"] == 0
+
+
+def test_pending_payload_is_bounded(exchange):
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    ch = R.ModChannel(exchange)
+    ch.poll_once()
+    big = {"blob": "x" * (R.MAX_ARGS_BYTES - 100)}
+    with pytest.raises(R.RelayError) as exc:
+        for i in range(R.MAX_PENDING_ARGS_BYTES // R.MAX_ARGS_BYTES + 2):
+            try:
+                ch.call("ping", big, f"big-{i}", 0.01)
+            except R.RelayError as inner:
+                if inner.code != "timeout":
+                    raise
+    assert exc.value.code == "too_much_pending"
+
+
+# ---------------------------------------------------------------------------
+# HTTP surface (requests are HMAC-signed; responses are signed back)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def server(tmp_path):
-    relay = make_relay(tmp_path)
+    relay = make_relay(tmp_path, screenshot_source="screen")
     srv = R.build_server(relay, port=0)
     t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
     t.start()
@@ -320,28 +505,55 @@ def server(tmp_path):
     srv.server_close()
 
 
-def _req(port, method, path, *, token=TOKEN, body=None, host=None, raw_length=None):
+def _req(port, method, path, *, token=TOKEN, body=None, host=None, raw_length=None, ts=None, nonce=None,
+         sign=True):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    data = json.dumps(body).encode() if body is not None else b""
     headers = {}
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
+    if sign:
+        ts = str(int(time.time())) if ts is None else ts
+        nonce = os.urandom(16).hex() if nonce is None else nonce
+        headers.update({"X-TF3-Timestamp": ts, "X-TF3-Nonce": nonce,
+                        "X-TF3-Signature": R.request_signature(token, method, path, ts, nonce, data)})
     if host is not None:
         headers["Host"] = host
-    data = json.dumps(body).encode() if body is not None else None
     if raw_length is not None:
         headers["Content-Length"] = str(raw_length)
-    conn.request(method, path, body=data, headers=headers)
+    conn.request(method, path, body=data or None, headers=headers)
     resp = conn.getresponse()
     out = resp.status, dict(resp.getheaders()), resp.read()
     conn.close()
+    if sign and "X-TF3-Response-Signature" in out[1]:
+        assert out[1]["X-TF3-Response-Signature"] == R.response_signature(TOKEN, nonce, out[0], out[2])
     return out
 
 
-def test_http_requires_token(server):
-    assert _req(server, "GET", "/v1/health", token=None)[0] == 401
-    assert _req(server, "GET", "/v1/health", token="wrong")[0] == 401
-    status, _, body = _req(server, "GET", "/v1/health")
+def test_http_requires_a_valid_signature(server):
+    assert _req(server, "GET", "/v1/health", sign=False)[0] == 401
+    assert _req(server, "GET", "/v1/health", token="w" * 43)[0] == 401
+    status, headers, body = _req(server, "GET", "/v1/health")
     assert status == 200 and json.loads(body)["policy"]["allow_lua"] is False
+    assert "X-TF3-Response-Signature" in headers  # verified inside _req
+
+
+def test_http_rejects_stale_and_replayed_requests(server):
+    assert _req(server, "GET", "/v1/health", ts=str(int(time.time()) - 600))[0] == 401
+    nonce = os.urandom(16).hex()
+    assert _req(server, "GET", "/v1/health", nonce=nonce)[0] == 200
+    status, _, body = _req(server, "GET", "/v1/health", nonce=nonce)
+    assert status == 401 and json.loads(body)["error"]["code"] == "replayed_request"
+
+
+def test_signature_covers_the_body(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    signed = json.dumps({"op": "hello", "args": {}}).encode()
+    sent = json.dumps({"op": "vehicle_sell", "args": {"vehicle_id": 1}}).encode()
+    ts, nonce = str(int(time.time())), os.urandom(16).hex()
+    conn.request("POST", "/v1/call", body=sent, headers={
+        "X-TF3-Timestamp": ts, "X-TF3-Nonce": nonce,
+        "X-TF3-Signature": R.request_signature(TOKEN, "POST", "/v1/call", ts, nonce, signed)})
+    assert conn.getresponse().status == 401
+    conn.close()
 
 
 def test_http_rejects_foreign_host_header(server):
@@ -354,7 +566,7 @@ def test_http_call_and_limits(server):
     assert status == 200 and json.loads(body)["result"] == {"op": "hello"}
     status, _, body = _req(server, "POST", "/v1/call", body={"op": "rm_rf", "args": {}})
     assert status == 400 and json.loads(body)["error"]["code"] == "unknown_op"
-    assert _req(server, "POST", "/v1/call", raw_length=R.MAX_BODY_BYTES + 1)[0] == 413
+    assert _req(server, "POST", "/v1/call", raw_length=R.MAX_BODY_BYTES + 1, sign=False)[0] == 413
     assert _req(server, "GET", "/v2/anything")[0] == 404
 
 
@@ -362,6 +574,25 @@ def test_http_screenshot_returns_jpeg(server):
     status, headers, body = _req(server, "GET", "/v1/screenshot?max_width=800&source=screen")
     assert status == 200 and headers["Content-Type"] == "image/jpeg" and body.startswith(b"\xff\xd8")
     assert headers["X-Image-Source"] == "screen"
+
+
+def test_idle_connections_are_closed(tmp_path, monkeypatch):
+    import socket
+    monkeypatch.setattr(R, "SOCKET_TIMEOUT_S", 1)
+    srv = R.build_server(make_relay(tmp_path), port=0)
+    t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    t.start()
+    try:
+        idle = socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=5)
+        idle.sendall(b"GET /v1/health HTTP/1.1\r\n")  # never finishes the request
+        start = time.monotonic()
+        idle.recv(1024)  # returns once the server gives up on the half-sent request
+        assert time.monotonic() - start < 4  # it hung up after ~1 s instead of waiting forever
+        idle.close()
+        assert _req(srv.server_address[1], "GET", "/v1/health")[0] == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_server_binds_loopback_only(tmp_path):

@@ -59,8 +59,8 @@ set(LINE, 'LINE', {
   vehicleInfo = { transportModes = { [3] = true } },  -- keyed by TransportMode enum values (3 = BUS)
 })
 owned(LINE)
-set(ST_A, 'STATION', { terminals = {} }); owned(ST_A)
-set(ST_B, 'STATION', { terminals = {} }); owned(ST_B)
+set(ST_A, 'STATION', { terminals = { {}, {} } }); owned(ST_A)  -- two platforms: terminals 0 and 1
+set(ST_B, 'STATION', { terminals = { {}, {} } }); owned(ST_B)
 set(GROUP_A, 'STATION_GROUP', { stations = { ST_A } })
 set(GROUP_B, 'STATION_GROUP', { stations = { ST_B } })
 set(CON_A, 'CONSTRUCTION', { fileName = '::/stations/street/x.con', transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 100,200,5,1 } })
