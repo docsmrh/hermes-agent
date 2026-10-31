@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the Hermes Bridge for Transport Fever 3 on a Mac.
 #
-#   ./install_mac.sh --vps hermes@vps.example.com [--userdata-dir DIR] [--port 47800] [--dry-run]
+#   ./install_mac.sh --vps tunnel@vps.example.com [--userdata-dir DIR] [--port 47800] [--dry-run]
 #   ./install_mac.sh --uninstall [--dry-run]
 #
 # What it does (nothing else):
@@ -218,7 +218,8 @@ TUNNEL_USER="${VPS%%@*}"
 cat <<EOF
 
 Done on the Mac. Finish on the VPS. Use a dedicated low-privilege account for
-the tunnel (e.g. 'sudo useradd -m -s /usr/sbin/nologin $TUNNEL_USER').
+the tunnel (e.g. 'sudo useradd -m -s /usr/sbin/nologin $TUNNEL_USER'), never one
+you or Hermes log in with: step 2 turns off shell logins for '$TUNNEL_USER'.
 
   1. Append this single line to that account's ~/.ssh/authorized_keys:
 

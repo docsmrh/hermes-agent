@@ -164,11 +164,11 @@ hermes cron pause tf3-autopilot   # stop the loop
 - **Tunnel key.** With the `Match` block, the tunnel account can only create that one loopback forward on the VPS.
 - **Auth.** The shared token is an HMAC-SHA256 key and is never sent over the wire.
   - Every request is signed over method, path, timestamp, nonce and body hash. Requests outside a 60 s window and replayed nonces are refused.
-  - Every response is signed back. If the tunnel is down and another local user on the VPS listens on `127.0.0.1:47800`, that user learns nothing reusable, and the plugin reports `relay_unauthenticated` instead of trusting the answers.
+  - Every response is signed back, except the two refusals sent before a request can be authenticated (wrong Host header, body over 256 KiB). If the tunnel is down and another local user on the VPS listens on `127.0.0.1:47800`, that user learns nothing reusable, and the plugin reports `relay_unauthenticated` instead of trusting the answers.
   - The plugin ignores `HTTP(S)_PROXY`.
   - The relay pins the Host header (which defeats DNS rebinding). It limits:
     - bodies (256 KiB), args per request (32 KiB) and total pending args (512 KiB);
-    - JSON nesting (32 levels; NaN and Infinity are refused);
+    - JSON nesting (32 levels) and numbers (NaN, Infinity and values that overflow a double are refused);
     - request ids, request rate, screenshot rate and pending requests;
     - concurrent connections, with a 15 s socket timeout.
   - The token is never printed by `init` or written to logs. To rotate it, run `tf3_relay.py init --rotate-token` (it takes effect immediately) and update the VPS `.env`.
@@ -181,7 +181,7 @@ hermes cron pause tf3-autopilot   # stop the loop
 
 ## Verification
 
-**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 127 tests.
+**Automated** (`scripts/run_tests.sh tests/plugins/tf3/`): 145 tests.
 - The real mod Lua runs under Lua 5.2 (`lupa`, optional; those tests are skipped without it). It runs against `tests/plugins/tf3/fake_game.lua`, a stand-in for the TF3 script runtime with real userdata files and a crash-strict `getComponent`.
 - The real relay and the real plugin run unchanged.
 - The end-to-end tests drive Hermes tools → HTTP → relay → files → mod → simulated engine and back.

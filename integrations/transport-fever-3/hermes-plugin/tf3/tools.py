@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
+import re
 import threading
 import time
 import uuid
@@ -24,7 +26,6 @@ from .guardrails import (
     Settings,
     check_action,
     check_cash_reserve,
-    effective_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,11 +33,21 @@ logger = logging.getLogger(__name__)
 TOKEN_ENV = "TF3_BRIDGE_TOKEN"
 SNAPSHOT_SECTIONS = ("game", "finance", "lines", "vehicles", "stations", "depots", "towns", "industries", "problems")
 DEFAULT_SECTIONS = ["game", "finance", "lines", "problems"]
-# Errors after which a state change may still take effect in the game.
-_OUTCOME_UNKNOWN = frozenset({"timeout", "transport_error", "game_reloaded"})
+# Errors after which a state change may still take effect in the game. An
+# unauthenticated answer proves nothing either: whoever sent it holds our
+# signed request and can still deliver it to the real relay.
+_OUTCOME_UNKNOWN = frozenset({"timeout", "transport_error", "game_reloaded", "relay_unauthenticated"})
 # Errors worth re-asking about with the same request id (the relay keeps the
-# request and hands back its late result; it is never queued twice).
+# request and hands back its late result instead of queueing it again).
 _RETRY_SAME_ID = frozenset({"timeout", "transport_error"})
+# Only these are re-asked: the simulation records every request id it ran
+# (ENGINE_OPS in ops.lua), even across a relay restart, whereas a GUI-side op
+# (set_speed, save_game, lua_eval) asked again after a restart would run again.
+_ENGINE_OPS = frozenset({
+    "line_create", "line_update", "line_delete",
+    "vehicle_buy", "vehicle_set_line", "vehicle_sell", "vehicle_to_depot", "vehicle_stop", "vehicle_start",
+    "build_construction", "bulldoze",
+})
 _RETRY_WINDOW_S = 110.0
 _JOURNAL_MAX_ENTRIES = 300
 _JOURNAL_MAX_TEXT = 1500
@@ -221,18 +232,31 @@ def _wants_dry_run(value: Any) -> bool:
     return bool(value)
 
 
+def _may_have_run(exc: BridgeError) -> bool:
+    # A 401 means the relay refused the request's signature: a stale or
+    # replayed one can mean someone else delivered our request first.
+    return exc.code in _OUTCOME_UNKNOWN or exc.status == 401
+
+
 def _call_state_change(client: BridgeClient, op: str, args: dict) -> Tuple[str, dict]:
     """Run a state-changing op; after a timeout ask again with the *same*
-    request id, which returns the late result instead of queueing it twice.
-    Returns (request_id, result); errors carry ``request_id``."""
+    request id, which returns the late result instead of running it twice.
+    Returns (request_id, result); errors carry ``request_id`` and
+    ``outcome_unknown``. Once an attempt may have reached the game, only a
+    success settles it: a later refusal (paused, rate limited, tunnel down)
+    says nothing about that attempt."""
     request_id = uuid.uuid4().hex
     started = time.monotonic()
+    uncertain = False
     while True:
         try:
             return request_id, client.call(op, args, request_id=request_id)
         except BridgeError as exc:
+            uncertain = uncertain or _may_have_run(exc)
             exc.request_id = request_id  # type: ignore[attr-defined]
-            if exc.code in _RETRY_SAME_ID and time.monotonic() - started < _RETRY_WINDOW_S:
+            exc.outcome_unknown = uncertain  # type: ignore[attr-defined]
+            if (op in _ENGINE_OPS and exc.code in _RETRY_SAME_ID
+                    and time.monotonic() - started < _RETRY_WINDOW_S):
                 if exc.code == "transport_error":
                     time.sleep(1.0)  # a timeout already waited; a broken connection should not spin
                 continue
@@ -249,7 +273,7 @@ def _record_action(entry: dict) -> None:
 
 
 def _failure_result(exc: BridgeError, *, request_id: str) -> str:
-    if exc.code in _OUTCOME_UNKNOWN:
+    if getattr(exc, "outcome_unknown", False) or _may_have_run(exc):
         return tool_error(exc.message, code=exc.code, retryable=False, outcome="unknown", request_id=request_id,
                           next_step="Re-observe and check whether the change happened before trying again.")
     return tool_error(exc.message, code=exc.code, retryable=exc.retryable, outcome="not_done",
@@ -449,33 +473,43 @@ def _finance_balance(client: BridgeClient) -> Optional[float]:
     return float(balance) if isinstance(balance, (int, float)) and not isinstance(balance, bool) else None
 
 
-def _check_unpause(client: BridgeClient, params: dict, settings: Settings) -> None:
+def _speedup_arg(value: Any) -> int:
+    """set_speed's speedup as one plain integer, so the pause guard and the mod
+    judge the same value (the mod would also accept "1.0" or "1e0")."""
+    if isinstance(value, str) and re.fullmatch(r"-?\d{1,3}", value.strip()):
+        value = int(value.strip())
+    if isinstance(value, float) and math.isfinite(value):
+        value = math.floor(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("speedup must be an integer 0-4 (0 = pause)")
+    return max(0, min(4, value))
+
+
+def _check_unpause(client: BridgeClient, speedup: int, settings: Settings) -> None:
     """Do not resume a game the player paused, unless the user allowed it or
-    the pause was the agent's own and the game has not moved since."""
-    try:
-        speedup = int(params.get("speedup"))
-    except (TypeError, ValueError):
-        return  # the mod rejects it with a proper message
-    if speedup <= 0 or settings.allow_unpause:
+    the pause was the agent's own and the game has not moved since. A game
+    that does not report whether, or since when, it is paused counts as
+    paused by the player."""
+    if speedup == 0 or settings.allow_unpause:
         return
     game = client.call("snapshot", {"sections": ["game"], "limit": 1}).get("game") or {}
-    if game.get("paused") is not True:
+    paused = game.get("paused")
+    if paused is False:
         return
     own = _state_get("agent_pause", None)
-    if isinstance(own, dict) and own.get("game_time") == game.get("game_time"):
+    game_time = game.get("game_time")
+    if (paused is True and isinstance(own, dict) and isinstance(game_time, (int, float))
+            and not isinstance(game_time, bool) and own.get("game_time") == game_time):
         return
+    state = "is paused" if paused is True else "may be paused (the bridge could not read its speed)"
     raise GuardrailError(
         "player_paused",
-        "the game is paused and tf3 does not resume a game the player paused "
+        f"the game {state} and tf3 does not resume a game the player paused "
         "(plugins.entries.tf3.settings.allow_unpause: true allows it). Journal it and end the turn.",
     )
 
 
-def _note_speed_change(client: BridgeClient, params: dict) -> None:
-    try:
-        speedup = int(params.get("speedup"))
-    except (TypeError, ValueError):
-        return
+def _note_speed_change(client: BridgeClient, speedup: int) -> None:
     if speedup == 0:
         game = client.call("snapshot", {"sections": ["game"], "limit": 1}).get("game") or {}
         _state_set("agent_pause", {"game_time": game.get("game_time"), "ts": _now_iso()})
@@ -496,6 +530,8 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
     reason = str(args.get("reason") or "").strip()[:500]
     settings = _settings()
     action_class = check_action(action, settings, params)
+    if action == "set_speed":
+        params["speedup"] = _speedup_arg(params.get("speedup"))
     client = _client()
     run = _run_key(kwargs)
     session = str(kwargs.get("session_id") or "")
@@ -506,8 +542,8 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
         return tool_result({"action": action, "dry_run": True, "result": result,
                             "elapsed_ms": int((time.monotonic() - started) * 1000)})
 
-    if effective_action(action, params) == "set_speed":
-        _check_unpause(client, params, settings)
+    if action == "set_speed":
+        _check_unpause(client, params["speedup"], settings)
     if action_class == "spend" and settings.min_cash_reserve > 0:
         preview = client.call(action, {**params, "dry_run": True})
         cost = preview.get("cost")
@@ -526,7 +562,7 @@ def handle_tf3_act(args: dict, **kwargs: Any) -> str:
         return _failure_result(exc, request_id=request_id)
     _record_action({**entry, "request_id": request_id, "ok": True, "result": result})
     if action == "set_speed":
-        _note_speed_change(client, params)
+        _note_speed_change(client, params["speedup"])
     return tool_result({
         "action": action,
         "dry_run": False,

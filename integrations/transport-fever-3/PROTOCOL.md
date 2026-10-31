@@ -28,9 +28,10 @@ The token (`TF3_BRIDGE_TOKEN`) is an HMAC-SHA256 key shared by the Mac relay con
   - a nonce already seen in the last 120 s.
 
   A failure gets 401, with code `unauthorized`, `stale_request` or `replayed_request`.
-- **Response signature.** Every response, including errors, carries `X-TF3-Response-Signature`: `hex(HMAC(token, "tf3-v1-resp\n" + NONCE + "\n" + STATUS + "\n" + hex(sha256(RESPONSE_BODY))))`.
+- **Response signature.** Every response to a request with a well-formed nonce, including errors, carries `X-TF3-Response-Signature`: `hex(HMAC(token, "tf3-v1-resp\n" + NONCE + "\n" + STATUS + "\n" + hex(sha256(RESPONSE_BODY))))`. The exceptions are the two refusals sent before a request can be authenticated: 421 `bad_host` and 413 `body_too_large`. They are unsigned, so the plugin never sends a body over 256 KiB and reports one as `body_too_large` without sending it.
   - The plugin rejects any response without a valid one as `relay_unauthenticated`. That happens with a wrong token, or with something other than the relay listening on the port while the tunnel is down.
-  - Such an impostor learns no reusable secret. A captured request can not be replayed after 60 s, nor twice.
+  - Such an impostor learns no reusable secret. A captured request can not be replayed after 60 s, nor twice, but it can be delivered once within the window, so an unauthenticated answer to a state change means its outcome is unknown.
+  - A 401 is signed over the request's nonce before the request is verified, to keep clock-skew errors readable. It therefore proves nothing about the request, and the plugin treats a 401 to a state change as outcome unknown.
 - **Config changes.** The relay re-reads `config.json` when it changes. A rotated token or a policy edit applies within a second.
 
 ### Error envelope
@@ -43,7 +44,7 @@ Every non-2xx JSON response, and a 2xx with `ok: false`, has this shape:
 
 | HTTP | code | Meaning |
 |---|---|---|
-| 400 | `invalid_request`, `unknown_op` | Malformed body (including NaN/Infinity, nesting deeper than 32 levels, or a non-boolean `args.dry_run`), or an op that is not on the relay allowlist |
+| 400 | `invalid_request`, `unknown_op` | Malformed body (including NaN/Infinity, a number that overflows a double such as `1e400`, nesting deeper than 32 levels, or a non-boolean `args.dry_run`), or an op that is not on the relay allowlist |
 | 401 | `unauthorized`, `stale_request`, `replayed_request` | Request signature failed (see Authentication) |
 | 403 | `paused`, `policy_denied` | Mac kill switch, or a policy flag in the Mac config |
 | 413 | `body_too_large`, `args_too_large` | The body is larger than 256 KiB, or one request's args serialize to more than 32 KiB |
@@ -58,15 +59,16 @@ The plugin reports what happened to each action:
 |---|---|---|
 | (none) | — | Success |
 | `outcome: not_done` | Refusals, validation errors, `engine_timeout`, `game_paused` | Nothing changed in the game |
-| `outcome: unknown` | `timeout`, `transport_error`, `game_reloaded` | The action may have happened, so re-observe before retrying |
+| `outcome: unknown` | `timeout`, `transport_error`, `game_reloaded`, `relay_unauthenticated`, any 401, and any error after one of these | The action may have happened, so re-observe before retrying |
 
-Before reporting `unknown`, the plugin re-asks with the same `request_id` for up to 110 s, which settles almost every timeout.
+Before reporting `unknown`, the plugin re-asks with the same `request_id` for up to 110 s, which settles almost every timeout. Once an attempt may have reached the game, only a success settles it: a refusal of the retry (`paused`, `rate_limited`, a tunnel that is still down) says nothing about the first attempt. Only engine ops are re-asked. The simulation records every id it ran, even across a relay restart, but a GUI-side op (`set_speed`, `save_game`, `lua_eval`) sent again after a restart would run again, so those are asked once.
 
 ### Endpoints
 
 - **`GET /v1/health`** returns the relay version, `policy` (`paused`, `allow_actions`, `allow_save`, `allow_lua`, `screenshot_enabled`, `screenshot_source`) and `mod` (`connected`, `heartbeat_age_s`, `stamp`, `mod_version`, `status`, `pending`).
 - **`POST /v1/call`** takes `{"op": str, "args": {...}, "request_id": "[A-Za-z0-9_-]{1,64}", "timeout_s": 1-60}` and returns `{"ok": true, "request_id": ..., "result": {...}, "elapsed_ms": n}`.
   - `request_id` makes the call idempotent end to end. The relay caches the last 256 results, and the mod's engine side never executes the same id twice.
+  - A call whose `request_id` the relay already holds (pending or cached) joins that request and returns its result. The policy and rate checks apply only to new requests, so a retry still learns what happened after the kill switch was engaged.
 - **`GET /v1/screenshot?max_width=320-3840&quality=30-95&source=game|auto|screen`** returns `image/jpeg` with the headers `X-Image-Width`, `X-Image-Height` and `X-Image-Source`.
   - The Mac config's `screenshot_source` is a ceiling; a request may only narrow it.
   - `game` (the default) asks the mod to call `api.gui.camera.takeScreenshot` and picks up the file it writes. It needs no macOS permission and shows nothing but the game.

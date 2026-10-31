@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 
 import httpx
 import pytest
@@ -85,7 +86,10 @@ class FakeRelay:
         self.calls.append((body["op"], body["args"], body["request_id"]))
         canned = self.script.get(body["op"])
         if canned:
-            status, payload = canned.pop(0)
+            entry = canned.pop(0)
+            if isinstance(entry, Exception):
+                raise entry  # a broken connection, as httpx reports it
+            status, payload = entry
             return self._respond(request, status, payload)
         if body["op"] == "snapshot":
             return self._respond(request, 200, {"ok": True, "result": {
@@ -185,6 +189,15 @@ def test_connection_refused_is_retried_then_reported(plugin):
         client.call("hello")
     assert exc.value.code == "bridge_unreachable" and exc.value.retryable
     assert len(attempts) == 2 and attempts[0] != attempts[1]  # each attempt is signed afresh
+
+
+def test_oversized_requests_are_refused_before_sending(wired):
+    """The relay would refuse them before authenticating, with an unsigned
+    answer that looks like an impostor's."""
+    plugin, ctx, relay = wired
+    out = run(plugin, "tf3_act", {"action": "line_update", "params": {"line_id": 1, "name": "x" * 300_000},
+                                  "reason": "x"})
+    assert (out["code"], out["outcome"]) == ("body_too_large", "not_done") and relay.calls == []
 
 
 def test_missing_token_is_not_configured(plugin):
@@ -363,6 +376,58 @@ def test_unknown_outcomes_are_flagged(wired, monkeypatch):
     assert out["outcome"] == "not_done"  # the mod guarantees an expired command never runs
 
 
+def test_a_later_refusal_does_not_settle_an_uncertain_attempt(wired):
+    """Once an attempt may have reached the game, only a success settles it:
+    a refusal of the retry (paused, tunnel down) says nothing about it."""
+    plugin, ctx, relay = wired
+    timeout = (504, {"ok": False, "error": {"code": "timeout", "message": "slow", "retryable": True}})
+    paused = (403, {"ok": False, "error": {"code": "paused", "message": "paused on the Mac"}})
+    relay.script["vehicle_buy"] = [timeout, paused]
+    out = run(plugin, "tf3_act", {"action": "vehicle_buy", "params": {"depot_id": 1, "model": "m"}, "reason": "x"})
+    assert (out["code"], out["outcome"]) == ("paused", "unknown")
+    relay.script["vehicle_sell"] = [httpx.ReadError("tunnel dropped"), httpx.ConnectError("refused"),
+                                    httpx.ConnectError("refused")]
+    out = run(plugin, "tf3_act", {"action": "vehicle_sell", "params": {"vehicle_id": 1}, "reason": "x"})
+    assert (out["code"], out["outcome"]) == ("bridge_unreachable", "unknown")
+    relay.script["vehicle_stop"] = [paused]  # refused on the only attempt: cleanly not done
+    out = run(plugin, "tf3_act", {"action": "vehicle_stop", "params": {"vehicle_id": 1}, "reason": "x"})
+    assert out["outcome"] == "not_done"
+
+
+def test_unauthenticated_answers_leave_the_outcome_unknown(wired):
+    """Whoever answered without the relay's signature holds our signed request
+    and can still deliver it to the real relay."""
+    plugin, ctx, relay = wired
+    relay.sign = False
+    out = run(plugin, "tf3_act", {"action": "vehicle_stop", "params": {"vehicle_id": 1}, "reason": "x"})
+    assert (out["code"], out["outcome"]) == ("relay_unauthenticated", "unknown")
+    assert relay.ops().count("vehicle_stop") == 1  # and it is not sent again
+    relay.sign = True
+    relay.script["vehicle_stop"] = [(401, {"ok": False, "error": {"code": "replayed_request", "message": "used"}})]
+    out = run(plugin, "tf3_act", {"action": "vehicle_stop", "params": {"vehicle_id": 1}, "reason": "x"})
+    assert out["outcome"] == "unknown"  # someone else used our signature first
+
+
+def test_gui_side_ops_are_asked_once(wired):
+    """The simulation runs an engine op at most once per request id, even across
+    a relay restart; a GUI-side op asked again after a restart would run again."""
+    plugin, ctx, relay = wired
+    timeout = (504, {"ok": False, "error": {"code": "timeout", "message": "slow", "retryable": True}})
+    relay.script["set_speed"] = [timeout, timeout]
+    out = run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 0}, "reason": "x"})
+    assert out["outcome"] == "unknown" and relay.ops().count("set_speed") == 1
+    relay.script["lua_eval"] = [timeout, timeout]
+    assert run(plugin, "tf3_lua", {"code": "return 1", "reason": "x"})["outcome"] == "unknown"
+    assert relay.ops().count("lua_eval") == 1
+
+
+def test_engine_ops_match_the_mod(plugin):
+    from tests.plugins.tf3.harness import MOD_CONTENT
+    source = (MOD_CONTENT / "hermes_bridge" / "ops.lua").read_text(encoding="utf-8")
+    block = re.search(r"M\.ENGINE_OPS = \{(.*?)\}", source, re.S).group(1)
+    assert set(re.findall(r"(\w+) = true", block)) == plugin.tools._ENGINE_OPS
+
+
 def test_player_pause_is_respected(wired):
     plugin, ctx, relay = wired
     relay.paused = True
@@ -376,6 +441,35 @@ def test_player_pause_is_respected(wired):
     ctx.settings["allow_unpause"] = True
     relay.paused, relay.game_time = True, 5000
     assert "error" not in run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 1}, "reason": "go"})
+
+
+@pytest.mark.parametrize("speedup", ["1.0", "1e0", "0x1", " 2 ", 1.5, "3", True, 10**400, float("inf")])
+def test_no_spelling_of_resume_slips_past_the_pause_guard(wired, speedup):
+    plugin, ctx, relay = wired
+    relay.paused = True
+    out = run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": speedup}, "reason": "go"})
+    assert out["code"] in {"player_paused", "invalid_argument"} and "set_speed" not in relay.ops()
+
+
+def test_speedup_reaches_the_mod_as_a_plain_integer(wired):
+    plugin, ctx, relay = wired
+    assert "error" not in run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": " 3 "}, "reason": "x"})
+    assert relay.calls[-1][1]["speedup"] == 3
+    assert "error" not in run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 9}, "reason": "x"})
+    assert relay.calls[-1][1]["speedup"] == 4
+
+
+def test_unknown_pause_state_counts_as_the_players(wired):
+    plugin, ctx, relay = wired
+    relay.game_time = None  # the bridge can not read the game clock
+    assert "error" not in run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 0}, "reason": "p"})
+    relay.paused = True  # paused again later, by the agent or the player: no way to tell
+    out = run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 2}, "reason": "go"})
+    assert out["code"] == "player_paused"
+    relay.paused, relay.game_time = None, 1000  # the bridge can not tell whether it is paused
+    out = run(plugin, "tf3_act", {"action": "set_speed", "params": {"speedup": 2}, "reason": "go"})
+    assert out["code"] == "player_paused" and "may be paused" in out["error"]
+    assert relay.ops().count("set_speed") == 1
 
 
 def test_screenshot_is_multimodal(wired):

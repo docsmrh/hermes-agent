@@ -34,6 +34,9 @@ PROTOCOL_VERSION = 1
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:47800"
 _MAX_TIMEOUT_S = 120.0
 _MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+# The relay refuses larger bodies before it can authenticate them, so its
+# answer would be unsigned; refuse them here, where nothing has been sent.
+_MAX_BODY_BYTES = 256 * 1024
 
 
 class BridgeError(Exception):
@@ -154,8 +157,8 @@ class BridgeClient:
             raise BridgeError(
                 "relay_unauthenticated",
                 f"the service at {self.base_url} did not prove it is the TF3 relay (bad or missing response "
-                "signature). Either TF3_BRIDGE_TOKEN differs from the Mac's token, or something else is "
-                "listening on that port while the SSH tunnel is down.",
+                f"signature on an HTTP {resp.status_code} answer). Either TF3_BRIDGE_TOKEN differs from the "
+                "Mac's token, or something else is listening on that port while the SSH tunnel is down.",
                 retryable=False,
                 status=resp.status_code,
             )
@@ -167,6 +170,9 @@ class BridgeClient:
         target = path + ("?" + urlencode(sorted(params.items())) if params else "")
         body = b"" if json_body is None else json.dumps(
             json_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(body) > _MAX_BODY_BYTES:
+            raise BridgeError("body_too_large", f"request is {len(body)} bytes; the relay accepts at most "
+                              f"{_MAX_BODY_BYTES}. Nothing was sent.")
         attempts = 2 if retry_connect else 1
         last_exc: Optional[Exception] = None
         for _ in range(attempts):

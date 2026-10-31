@@ -219,7 +219,9 @@ class StubChannel:
         self.calls = []
         self._connected = connected
 
-    def call(self, op, args, request_id, timeout_s):
+    def call(self, op, args, request_id, timeout_s, admit=None):
+        if admit is not None:
+            admit()  # the relay's policy and rate checks, as ModChannel runs them
         self.calls.append(op)
         return {"ok": True, "result": {"op": op}}
 
@@ -298,9 +300,31 @@ def test_dry_run_must_be_a_boolean(tmp_path):
     assert channel.calls == ["vehicle_sell"] * 3
 
 
+def test_a_retry_collects_its_result_after_the_kill_switch(tmp_path, exchange):
+    """A same-id retry joins the request the relay holds, so it learns what
+    happened even if automation was paused in between; new requests are refused."""
+    sim = SimMod(exchange)
+    sim.write_outbox()
+    channel = R.ModChannel(exchange)
+    channel.poll_once()
+    relay = make_relay(tmp_path, channel)
+    stop = {"op": "vehicle_stop", "args": {"vehicle_id": 1}, "request_id": "late-1", "timeout_s": 1}
+    with pytest.raises(R.RelayError) as exc:
+        relay.call(stop)  # the game is slow...
+    assert exc.value.code == "timeout"
+    sim.serve_once()  # ...then runs it
+    channel.poll_once()
+    relay.config.paused_flag.write_text("stop")
+    assert relay.call(stop)["result"]["op"] == "vehicle_stop"
+    assert sim.executed == ["late-1"]
+    with pytest.raises(R.RelayError) as exc:
+        relay.call({**stop, "request_id": "new-1"})
+    assert exc.value.code == "paused"
+
+
 def test_mod_errors_map_to_422(tmp_path):
     class Failing(StubChannel):
-        def call(self, *a):
+        def call(self, *a, **kw):
             return {"ok": False, "error": {"code": "not_found", "message": "line 7 does not exist"}}
     with pytest.raises(R.RelayError) as exc:
         make_relay(tmp_path, Failing()).call({"op": "line_delete", "args": {"line_id": 7}})
@@ -309,10 +333,10 @@ def test_mod_errors_map_to_422(tmp_path):
 
 def _shooting_channel(shots):
     class Shooting(StubChannel):
-        def call(self, op, args, request_id, timeout_s):
+        def call(self, op, args, request_id, timeout_s, admit=None):
             if op == "take_screenshot":
                 (shots / "shot.png").write_bytes(b"\x89PNG")
-            return super().call(op, args, request_id, timeout_s)
+            return super().call(op, args, request_id, timeout_s, admit)
     return Shooting()
 
 
@@ -366,10 +390,14 @@ def test_request_size_and_shape_limits(tmp_path):
         relay.call({"op": "hello", "args": {"blob": "x" * (R.MAX_ARGS_BYTES + 1)}})
     assert exc.value.status == 413
     for raw in [b'{"op":"hello","args":{"x":NaN}}', b'{"op":"hello","args":{"x":Infinity}}',
-                b'{"op":"hello","args":' + b'[' * 40 + b']' * 40 + b'}']:
+                b'{"op":"hello","args":' + b'[' * 40 + b']' * 40 + b'}',
+                # out of range for the mod's doubles: inf would reach the inbox as Infinity
+                b'{"op":"hello","args":{"x":1e400}}', b'{"op":"hello","args":{"x":-1e400}}',
+                b'{"op":"hello","args":{"x":' + b'9' * 400 + b'}}']:
         with pytest.raises(R.RelayError) as exc:
             R.parse_request_json(raw)
         assert exc.value.code == "invalid_request"
+    assert R.parse_request_json(b'{"a":1.5,"b":-2,"c":1e300}') == {"a": 1.5, "b": -2, "c": 1e300}
 
 
 def test_config_changes_apply_without_restart(tmp_path):

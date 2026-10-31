@@ -281,6 +281,46 @@ def test_paused_simulation_times_out_engine_ops(tmp_path):
         assert stored.hermes_bridge_results[rid].error.code == "expired"
 
 
+def test_engine_deadlines_need_a_wall_clock(tmp_path):
+    """The GUI and the simulation must date a command on the same clock, or a
+    command the GUI already called expired could still run."""
+    g = FakeGame(tmp_path / "userdata")
+    ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01, policy_fn=open_policy)
+    g.run(3)
+    ch.poll_once()
+    ch.start()
+    stop = False
+
+    def frames_only():
+        while not stop:
+            g.frame()
+            time.sleep(0.004)
+
+    import threading
+    t = threading.Thread(target=frames_only, daemon=True)
+    t.start()
+    try:
+        rid = uuid.uuid4().hex
+        with pytest.raises(R.RelayError) as exc:
+            call(ch, "vehicle_stop", {"vehicle_id": 500}, request_id=rid, timeout=1)
+        assert exc.value.code == "timeout"  # forwarded; the simulation has not stepped yet
+        with g.lock:
+            g.rt.execute("os.time = nil")  # and now neither side has a wall clock
+        g.step()  # the simulation can not check the deadline, so it refuses the command
+        with pytest.raises(R.RelayError) as exc:
+            call(ch, "vehicle_stop", {"vehicle_id": 500}, request_id=rid, timeout=5)
+        assert exc.value.code == "expired"
+        with pytest.raises(R.RelayError) as exc:  # new commands are not forwarded at all
+            call(ch, "vehicle_stop", {"vehicle_id": 500}, timeout=5)
+        assert exc.value.code == "api_unavailable"
+    finally:
+        stop = True
+        t.join()
+        ch.stop()
+    g.run(30)
+    assert "vehicle_stopped" not in g.log_kinds()
+
+
 def test_gui_errors_are_contained(game):
     game.rt.execute("app.loadUserdata = function() error('boom') end")
     game.run(50)  # must not raise into the game
@@ -354,20 +394,29 @@ def test_pending_actions_are_not_replayed_into_a_reloaded_game(tmp_path):
 
 
 def test_kill_switch_reaches_requests_already_queued(tmp_path):
+    import threading
     g = FakeGame(tmp_path / "userdata")
     policy = dict(OPEN_POLICY)
     ch = R.ModChannel(g.userdata / "heightmaps", poll_s=0.01, policy_fn=lambda: dict(policy))
     g.run(3)
     ch.poll_once()
-    policy["paused"] = True  # `tf3_relay.py pause` lands before the mod picks the request up
+    out = {}
+    caller = threading.Thread(target=lambda: out.update(
+        res=ch.call("vehicle_stop", {"vehicle_id": 500}, "queued-1", 10)), daemon=True)
+    caller.start()  # the request is written to the inbox under the open policy...
+    deadline = time.monotonic() + 5
+    while ch.mod_info()["pending"] != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ch.mod_info()["pending"] == 1
+    policy["paused"] = True  # ...then `tf3_relay.py pause` lands before the mod's next poll
     ch.start()
     g.start()
     try:
-        res = ch.call("vehicle_stop", {"vehicle_id": 500}, "queued-1", 10)
+        caller.join(timeout=15)
     finally:
         g.stop()
         ch.stop()
-    assert res["ok"] is False and res["error"]["code"] == "paused"
+    assert out["res"]["ok"] is False and out["res"]["error"]["code"] == "paused"
     assert "vehicle_stopped" not in g.log_kinds()
 
 

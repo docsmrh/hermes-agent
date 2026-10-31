@@ -42,6 +42,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -753,13 +754,23 @@ class ModChannel:
             info["pending"] = len(self._pending)
         return info
 
-    def call(self, op: str, args: dict, request_id: str, timeout_s: float) -> dict:
+    def call(self, op: str, args: dict, request_id: str, timeout_s: float,
+             admit: Optional[Callable[[], None]] = None) -> dict:
+        """Queue a request for the mod and wait for its result.
+
+        A request id the relay already holds is joined instead, so a retry
+        collects the original result even if the policy or rate limit changed
+        since. ``admit`` (raising RelayError to refuse) runs for new requests
+        only, under the same lock, so nothing new skips it.
+        """
         size = len(json.dumps(args, ensure_ascii=True, separators=(",", ":")))
         with self._lock:
             if request_id in self._done:
                 return self._done[request_id]
             pending = self._pending.get(request_id)
             if pending is None:
+                if admit is not None:
+                    admit()
                 if len(self._pending) >= MAX_PENDING:
                     raise RelayError(429, "too_many_pending", "too many requests waiting on the game", retryable=True)
                 if sum(p.size for p in self._pending.values()) + size > MAX_PENDING_ARGS_BYTES:
@@ -905,6 +916,22 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not valid JSON")
 
 
+def _finite_float(text: str) -> float:
+    # 1e400 parses to inf, which the inbox would carry as Infinity: a file the
+    # mod can not decode, stalling every request behind it.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text[:20]} is out of range")
+    return value
+
+
+def _bounded_int(text: str) -> int:
+    # Longer literals overflow the mod's doubles (and are slow to parse).
+    if len(text.lstrip("-")) > 308:
+        raise ValueError("integer literal is out of range")
+    return int(text)
+
+
 def _json_depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
     stack = [(value, 1)]
     while stack:
@@ -919,9 +946,10 @@ def _json_depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
 
 
 def parse_request_json(raw: bytes) -> Any:
-    """Strict JSON for request bodies: no NaN/Infinity, bounded nesting."""
+    """Strict JSON for request bodies: finite numbers only, bounded nesting."""
     try:
-        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite_float,
+                          parse_int=_bounded_int)
     except (UnicodeDecodeError, ValueError):
         raise RelayError(400, "invalid_request", "body is not valid JSON")
     if not _json_depth_ok(body):
@@ -1057,8 +1085,14 @@ class Relay:
         if op in LUA_OPS and not pol["allow_lua"]:
             raise RelayError(403, "policy_denied", "allow_lua is false in the Mac relay config")
 
-    def _run_op(self, op: str, args: dict, request_id: str, timeout_s: float) -> dict:
-        res = self.channel.call(op, args, request_id, timeout_s)
+    def _admit(self, op: str) -> None:
+        self.check_op(op)
+        if not self.limiter.allow():
+            raise RelayError(429, "rate_limited", "too many requests", retryable=True)
+
+    def _run_op(self, op: str, args: dict, request_id: str, timeout_s: float,
+                admit: Optional[Callable[[], None]] = None) -> dict:
+        res = self.channel.call(op, args, request_id, timeout_s, admit=admit)
         if not res.get("ok"):
             err = res.get("error") if isinstance(res.get("error"), dict) else {}
             raise RelayError(422, str(err.get("code") or "op_failed"),
@@ -1087,11 +1121,10 @@ class Relay:
         except (TypeError, ValueError):
             raise RelayError(400, "invalid_request", "timeout_s must be a number")
         timeout_s = max(1.0, min(timeout_s, MAX_CALL_TIMEOUT_S))
-        self.check_op(op)
-        if not self.limiter.allow():
-            raise RelayError(429, "rate_limited", "too many requests", retryable=True)
+        if op not in ALL_OPS:
+            raise RelayError(400, "unknown_op", f"op {op!r} is not on the relay allowlist")
         started = time.monotonic()
-        res = self._run_op(op, args, request_id, timeout_s)
+        res = self._run_op(op, args, request_id, timeout_s, admit=lambda: self._admit(op))
         return {"ok": True, "request_id": request_id, "result": res.get("result"),
                 "elapsed_ms": int((time.monotonic() - started) * 1000)}
 

@@ -162,12 +162,18 @@ function util.clamp_int(v, lo, hi, default)
   return n
 end
 
--- Wall-clock seconds for coarse timeouts (mods get os.time/clock/date/getenv);
--- the frame counter is a fallback so timeouts still progress without it.
-function util.now(frame)
+-- Wall-clock seconds (mods get os.time/clock/date/getenv), or nil without them.
+function util.wall_time()
   local t = util.try(util.path(os, 'time'))
   if type(t) == 'number' then return t end
-  return (frame or 0) / 60
+  return nil
+end
+
+-- Seconds for coarse timeouts; the frame counter is a fallback so timeouts
+-- still progress without a wall clock. Never use it for engine deadlines,
+-- which the GUI and the simulation must read off the same clock.
+function util.now(frame)
+  return util.wall_time() or (frame or 0) / 60
 end
 
 return util

@@ -292,7 +292,16 @@ local function forward(rec, op, args)
     complete(rec, false, { code = 'api_unavailable', message = 'script events are unavailable' })
     return
   end
-  local deadline = util.now(S.frame) + ENGINE_DEADLINE_S
+  local wall = util.wall_time()
+  if wall == nil then
+    -- The simulation checks the deadline on its own clock; without a shared
+    -- wall clock it could run a command the GUI already declared expired.
+    complete(rec, false, { code = 'api_unavailable',
+      message = 'this game build gives mods no wall clock (os.time), so commands can not carry a deadline; '
+        .. 'nothing was done' })
+    return
+  end
+  local deadline = wall + ENGINE_DEADLINE_S
   local param = { key = rec.id, op = op, args = args, expires_at = deadline }
   local ok, err = pcall(sendCommand, make('', EVENT_ID, EVENT_NAME, param))
   if not ok then
@@ -476,7 +485,8 @@ function M.engine_handle_event(state, src, id, name, param)
   local st = util.try(function() return state:get() end)
   local seen = type(st) == 'table' and type(st.hermes_bridge_results) == 'table' and st.hermes_bridge_results[key]
   if seen then return end -- already executed: at most once per request id
-  if type(param.expires_at) ~= 'number' or util.now(0) > param.expires_at then
+  local now = util.wall_time()
+  if type(param.expires_at) ~= 'number' or now == nil or now > param.expires_at then
     store_engine_result(state, key, false, { code = 'expired',
       message = 'the command reached the simulation after its deadline and was not run' })
     return
