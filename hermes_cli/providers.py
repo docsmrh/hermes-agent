@@ -571,6 +571,30 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     return None
 
 
+def _curated_label(provider_id: str, canonical: str) -> str:
+    """Curated label fallback: the picker list in ``hermes_cli.models``.
+
+    ``CANONICAL_PROVIDERS`` ships a human-readable label for every built-in
+    provider and needs no catalog, so it is the fallback whenever neither
+    models.dev nor the overlay / plugin profile supplies a display name:
+    models.dev unreachable with nothing cached yet (first run on a
+    firewalled machine), or a Hermes-only id that is absent from the
+    catalog under its mapped id even online (``openai-api``,
+    ``azure-foundry``, bare ``custom``).  Looked up by canonical id first,
+    then by the caller's raw id — the picker passes ``CANONICAL_PROVIDERS``
+    slugs, which ``normalize_provider`` may map to a different models.dev
+    id (``kilocode`` → ``kilo``; ``kimi-coding`` and ``kimi-coding-cn``
+    both → ``kimi-for-coding``, so only the raw id tells them apart).
+    Returns "" when neither is a curated provider.
+    """
+    try:
+        from hermes_cli.models import _PROVIDER_LABELS
+    except Exception:
+        return ""
+    raw = (provider_id or "").strip().lower()
+    return _PROVIDER_LABELS.get(canonical) or _PROVIDER_LABELS.get(raw) or ""
+
+
 def get_label(provider_id: str) -> str:
     """Get a human-readable display name for a provider."""
     canonical = normalize_provider(provider_id)
@@ -579,12 +603,17 @@ def get_label(provider_id: str) -> str:
     if canonical in _LABEL_OVERRIDES:
         return _LABEL_OVERRIDES[canonical]
 
-    # Try models.dev
+    # Try models.dev (or the overlay / plugin-profile fallbacks).  Both
+    # fallbacks hand back the bare id when they have no display name of
+    # their own, so only trust ``pdef.name`` when it is an actual label.
     pdef = get_provider(canonical)
-    if pdef:
+    if pdef and pdef.name and pdef.name != canonical:
         return pdef.name
 
-    return canonical
+    # No display name from the catalog, overlay, or plugin profile: fall
+    # back to the curated picker label rather than collapsing to the raw id
+    # ("xai" instead of "xAI").  Unknown ids still pass through unchanged.
+    return _curated_label(provider_id, canonical) or canonical
 
 
 
