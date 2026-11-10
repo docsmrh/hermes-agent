@@ -1472,14 +1472,25 @@ class TestGeneratedUnitIncludesLocalBin:
 
 
     def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
+        # Pin the service identity: _system_service_identity() auto-detects the
+        # invoking user and deliberately refuses an auto-detected root (the
+        # --run-as-user override exists for that), so an unpinned system=True
+        # call would depend on who runs the suite. Every other system-unit
+        # test in this file pins it the same way.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
         monkeypatch.setattr(
             gateway_cli,
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
         unit = gateway_cli.generate_systemd_unit(system=True)
-        # System unit uses the resolved home dir from _system_service_identity
-        assert "/.local/bin" in unit
+        # System unit uses the TARGET user's resolved home dir from
+        # _system_service_identity, not the caller's.
+        assert "/home/alice/.local/bin" in unit
 
 
 class TestSystemServiceIdentityRootHandling:

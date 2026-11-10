@@ -32,6 +32,26 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     assert completed.stdout == expected_output
 
 
+def _man_resolves_page(page: str) -> bool:
+    """Return True when the installed ``man`` is a real man-db that can find *page*.
+
+    ``shutil.which("man")`` is not enough for the pager probe: Ubuntu
+    "minimized" images install ``/usr/bin/man`` as a stub shell script that
+    prints an advisory and exits 0 without parsing options or spawning a
+    pager, and dpkg ``path-exclude=/usr/share/man/*`` strips the coreutils
+    pages so even a real man-db exits with "No manual entry" before it ever
+    reaches ``--pager``.  Requiring ``man -w <page>`` to print an existing
+    file path rejects both cases (the stub exits 0 but prints prose).
+    """
+    try:
+        completed = subprocess.run(
+            ["man", "-w", page], text=True, capture_output=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and os.path.isfile(completed.stdout.strip())
+
+
 @pytest.mark.parametrize(
     ("tool", "args", "stdin", "needs_tty"),
     [
@@ -49,6 +69,11 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "man" and not _man_resolves_page(args[-1]):
+        pytest.skip(
+            f"man on this host is a stub or lacks the {args[-1]!r} page "
+            "(man -w did not resolve a file)"
+        )
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
