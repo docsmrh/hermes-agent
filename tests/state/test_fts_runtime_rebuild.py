@@ -237,8 +237,11 @@ class TestRuntimeFtsRebuild:
         proc_root = tmp_path / "proc"
         for pid in (111, 222):
             (proc_root / str(pid) / "fd").mkdir(parents=True)
-        # PID 222's fd dir is unreadable (PermissionError)
-        os.chmod(proc_root / "222" / "fd", 0o000)
+        # PID 222's fd dir is unreadable (PermissionError). The kernel's
+        # EACCES is injected through the same listdir seam the test already
+        # redirects, rather than chmod 0o000, so the case is host-independent
+        # (root ignores mode bits; Windows has no POSIX directory perms).
+        unreadable_fd_dir = str(proc_root / "222" / "fd")
         # PID 222's cmdline is world-readable and looks like Hermes
         cmdline_path = proc_root / "222" / "cmdline"
         cmdline_path.write_bytes(b"python3\x00hermes_cli.main\x00chat\x00")
@@ -250,6 +253,8 @@ class TestRuntimeFtsRebuild:
         def _listdir(path):
             if isinstance(path, str):
                 path = path.replace("/proc", str(proc_root))
+                if path == unreadable_fd_dir:
+                    raise PermissionError(13, "Permission denied", path)
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
         # _read_proc_cmdline opens /proc/<pid>/cmdline directly; redirect
@@ -271,9 +276,6 @@ class TestRuntimeFtsRebuild:
         assert len(holders) == 1
         assert holders[0][0] == 222
         assert "hermes_cli.main" in holders[0][1]
-
-        # Cleanup
-        os.chmod(proc_root / "222" / "fd", 0o755)
 
     def test_corruption_error_classification_covers_both_sqlite_messages(self):
         """SQLite's message for a corrupt FTS index varies by version: older

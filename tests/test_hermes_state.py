@@ -813,19 +813,35 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    def test_search_projection_skips_context_enrichment_queries(
+        self, db, monkeypatch
+    ):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
+        # Trace every connection a read can actually be served from. Under
+        # WAL the read path borrows pooled connections via
+        # _checkout_read_conn -- a bare _get_read_conn() opens a fresh,
+        # untracked connection that no later query ever touches -- and
+        # without WAL (or past the pool ceiling) it falls back to the
+        # writer connection. Hooking the acquisition seam covers both
+        # without guessing which connection object will be handed out.
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        traced_connections = []
+
+        def trace(conn):
+            if conn is not None and not any(c is conn for c in traced_connections):
+                conn.set_trace_callback(statements.append)
+                traced_connections.append(conn)
+            return conn
+
+        real_checkout = db._checkout_read_conn
+        monkeypatch.setattr(
+            db, "_checkout_read_conn", lambda: trace(real_checkout())
+        )
+        trace(db._conn)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)

@@ -91,6 +91,11 @@ class TestAbiStamp:
         assert stamp.read_text().strip() == ld._python_abi_tag()
 
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores directory write bits",
+    )
     def test_readonly_target_reports_error(self, tmp_path):
         # A path under a non-writable parent should surface a clean error,
         # not raise.
@@ -103,6 +108,20 @@ class TestAbiStamp:
             assert "not writable" in err
         finally:
             os.chmod(ro_parent, 0o700)  # let pytest clean up
+
+    def test_mkdir_failure_is_reported_not_raised(self, tmp_path, monkeypatch):
+        # Host-independent twin of the read-only-parent case: whatever the
+        # filesystem layer raises (read-only mount, EACCES, EROFS) must come
+        # back as the error string, never propagate. Injected so it also runs
+        # where mode bits are not honoured (root, Windows).
+        def _deny(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "mkdir", _deny)
+        err = ld._ensure_target_ready(tmp_path / "lazy")
+        assert err is not None
+        assert "not writable" in err
+        assert "Permission denied" in err
 
 
 # ---------------------------------------------------------------------------

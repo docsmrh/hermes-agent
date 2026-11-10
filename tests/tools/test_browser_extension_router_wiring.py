@@ -42,6 +42,28 @@ def _route_spy(monkeypatch):
         lambda url="", task_id=None, local_browser=False: "legacy-nav",
     )
     monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
+    # Stub every legacy backend the browser_* handlers fall back to, not just
+    # browser_navigate. The handler lambdas resolve these names on the module
+    # at call time, so an unstubbed one runs the real _run_browser_command:
+    # it spawns agent-browser / npx and waits on command timeouts — ~20s of
+    # wall clock on an idle 4-core box and past the 300s per-file budget under
+    # CI-like load. This test pins wiring only; no backend may run.
+    for legacy_name in (
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_scroll",
+        "browser_back",
+        "browser_press",
+        "browser_get_images",
+        "browser_vision",
+        "browser_console",
+    ):
+        monkeypatch.setattr(
+            browser_tool,
+            legacy_name,
+            lambda *a, _name=legacy_name, **k: f"legacy-{_name}",
+        )
     return calls
 
 

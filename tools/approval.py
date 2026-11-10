@@ -1349,6 +1349,30 @@ _PATH_TOKEN_STOP = r"""\s'"`;|&<>()"""
 # One path segment (no separators, no terminators) preceded by a separator.
 _PATH_TAIL = r"(?P<tail>(?:[/\\][^/\\" + _PATH_TOKEN_STOP + r"]*)+)"
 
+# Characters that can immediately precede a separator *inside* a path token:
+# a word character, ``.`` (``./x``, ``../x``), ``~``, another separator, or a
+# closing ``)`` / ``}`` from ``$(pwd)/x`` / ``${DIR}/x``. A home prefix preceded
+# by one of these is a sub-directory of something else (``/srv/root/x``,
+# ``${DIR}/root/x``, ``/opt/home/alice/x``), not the home itself, so the fold
+# must not fire there. Anything else (start of string, whitespace, quotes,
+# ``=``, ``:``, redirection and other shell metacharacters) starts a new token,
+# so ``--dest=/root/.bashrc`` and ``'/root/.ssh/...'`` still fold.
+_HOME_FOLD_NOT_MID_TOKEN = r"(?<![\w.~/\\)}])"
+
+# Top-level system directories whose literal the detector keys on: ``/etc/``
+# (_SYSTEM_CONFIG_PATH), ``/dev/sd`` and ``of=/dev/...`` (the redirect and dd
+# hardline rules), ``/private/...`` (_MACOS_PRIVATE_SYSTEM_PATH) and the
+# recursive-delete roots in _HARDLINE_SYSTEM_DIRS. A HOME / HERMES_HOME equal
+# to one of these (Debian's ``sys`` account has HOME=/dev, ``bin`` has
+# HOME=/bin) must never fold, or ``dd if=/dev/zero of=/dev/sda`` would reach
+# the unconditional hardline floor as ``of=~/sda`` and sail past it.
+# ``root`` is deliberately absent: ``/root`` is the real home of a root-run
+# Hermes and is exactly the case the single-component acceptance exists for.
+_SYSTEM_TOP_LEVEL_DIRS = frozenset({
+    "etc", "dev", "usr", "bin", "sbin", "var", "boot", "lib", "lib64",
+    "proc", "sys", "home", "private",
+})
+
 
 @functools.lru_cache(maxsize=64)
 def _home_prefix_fold_regex(path: str):
@@ -1362,24 +1386,45 @@ def _home_prefix_fold_regex(path: str):
     patterns (``~/.ssh/authorized_keys``) still match. The trailing tail is
     required (``+``), so a bare home with no path under it is not folded.
 
-    Returns ``None`` for an unset or degenerate path — one with fewer than two
-    components below the root — so a stray HOME / HERMES_HOME such as ``/``,
-    ``C:\\`` or ``""`` cannot rewrite unrelated filesystem prefixes. Cached
+    The match is anchored at the start of a path token: a root-anchored home
+    (POSIX ``/home/alice``, UNC ``\\\\srv\\share\\alice``) requires its leading
+    separator, and no form may be preceded by a path character
+    (``_HOME_FOLD_NOT_MID_TOKEN``), so ``/opt/home/alice/x`` or ``${DIR}/root/x``
+    never fold.
+
+    Returns ``None`` for an unset or degenerate path — ``""``, a bare root
+    (``/``), a bare Windows drive (``C:\\``) or a top-level system directory
+    (``/etc``, ``/dev``, see ``_SYSTEM_TOP_LEVEL_DIRS``) — so a stray HOME /
+    HERMES_HOME cannot rewrite unrelated filesystem prefixes or erase the
+    system literals the hardline rules key on. Any other *single* component
+    IS accepted when it hangs directly off the root: ``/root`` is the real
+    home of a Hermes run as uid 0 (a bare VPS install, a generic container),
+    and a one-component HERMES_HOME such as ``/hermes`` is plausible.
+    Rejecting those left ``cat key >> /root/.ssh/authorized_keys`` unfolded
+    and therefore invisible to the ``~/.ssh`` approval patterns. Cached
     because the resolved home is stable across calls on this hot path.
     """
     if not path:
         return None
     components = [c for c in re.split(r"[/\\]+", path) if c]
-    # Require at least two non-empty components below the root. For POSIX this
-    # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
-    # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
-    # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    if not components:
+        return None
+    rooted = path[0] in "/\\"
+    # A lone component is only a home when it is root-anchored (``/root``) and
+    # is not a protected system directory. Unrooted singletons — a bare drive
+    # (``C:\\`` -> ``C:``) or a relative HOME — are degenerate and must not
+    # fold; ``/etc`` / ``/dev`` must not fold or they would hide the ``/etc/``
+    # and ``/dev/sd`` literals from the system-config and hardline rules.
+    if len(components) == 1 and (
+        not rooted or components[0] in _SYSTEM_TOP_LEVEL_DIRS
+    ):
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
-    # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows
-    # drive letter is captured as the first component.
-    return re.compile(r"[/\\]*" + body + _PATH_TAIL)
+    # A root-anchored home requires its leading separator(s) so ``root`` never
+    # matches inside ``chroot/x`` or ``/newroot/x``; a Windows drive letter is
+    # itself the first component, so the lead stays optional there.
+    lead = r"[/\\]+" if rooted else r"[/\\]*"
+    return re.compile(_HOME_FOLD_NOT_MID_TOKEN + lead + body + _PATH_TAIL)
 
 
 def _fold_home_prefixes(command: str, paths, replacement: str) -> str:

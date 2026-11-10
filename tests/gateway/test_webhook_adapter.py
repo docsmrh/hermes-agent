@@ -901,6 +901,24 @@ class TestDualStackBind:
         and ::1 (v6) are reachable — exactly what 6PN needs. Uses a real bind
         on an OS-assigned port (no mock) and inspects the runner's addresses.
         """
+        # Guard: on hosts without a usable IPv6 stack (e.g. a container whose
+        # kernel lacks AF_INET6 — socket() raises EAFNOSUPPORT — or one with
+        # IPv6 disabled so ::1 cannot be bound), asyncio.create_server skips
+        # the v6 family and the dual-stack default legitimately yields an
+        # IPv4-only listener. That is the environment, not a regression.
+        # Probe an actual ::1 bind rather than trusting socket.has_ipv6 (a
+        # compile-time constant that stays True on such hosts). Mirrors the
+        # guard on the LINE adapter's sibling test.
+        if not socket.has_ipv6:
+            pytest.skip("IPv6 not supported by this Python build")
+        try:
+            _probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                _probe.bind(("::1", 0))
+            finally:
+                _probe.close()
+        except OSError:
+            pytest.skip("IPv6 stack unavailable on this host (cannot bind ::1)")
         # Build config WITHOUT a host key so the real DEFAULT_HOST (None)
         # applies — _make_adapter's helper injects host="0.0.0.0" by default,
         # which would mask the dual-stack default under test here.

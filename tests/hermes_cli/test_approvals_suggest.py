@@ -157,6 +157,20 @@ class TestNormalizeAndGlob:
         assert "~/project/file.txt" in normalized
         assert home not in normalized
 
+    def test_normalize_folds_single_component_home(self, monkeypatch):
+        # A Hermes run as uid 0 has HOME=/root: a one-component home must
+        # still fold so proposals stay portable, while ``root`` buried in
+        # another path must be left alone.
+        monkeypatch.setenv("HOME", "/root")
+        assert (
+            normalize_command("git checkout -- /root/project/file.txt")
+            == "git checkout -- ~/project/file.txt"
+        )
+        assert (
+            normalize_command("git checkout -- /srv/root/project/file.txt")
+            == "git checkout -- /srv/root/project/file.txt"
+        )
+
     def test_derive_glob_uses_first_two_tokens(self):
         assert derive_glob("git push --force origin main") == "git push *"
         assert derive_glob("docker restart web") == "docker restart *"

@@ -171,6 +171,16 @@ class TestTextOnlyMainSkippedForVision:
 
         Pre-fix this silently returned the deepseek client with model
         substitution, producing ``unknown variant 'image_url'`` at call time.
+
+        The guard is catalog-driven by design (unknown → permissive, see
+        ``test_unknown_capability_does_not_block``), so the catalog verdict
+        is supplied here instead of depending on a live models.dev fetch,
+        which made this test fail on any offline or TLS-intercepted runner.
+        The fake also pins the network-permitted lookup contract: a cold
+        cache only yields data when the guard asks with
+        ``allow_network=True`` (agent/image_routing.py); an
+        ``allow_network=False`` default silently turned the guard into a
+        no-op once (a3cda34137) and must fail this test again.
         """
         _write_config(isolated_home, """
 model:
@@ -180,6 +190,21 @@ model:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
+        # agent.models_dev is not in _RELOAD_PREFIXES and image_routing
+        # imports get_model_capabilities at call time, so a module-attribute
+        # patch is honoured after _fresh_modules().
+        from agent import models_dev
+
+        seen_allow_network: list[bool] = []
+
+        def _text_only_catalog(provider, model, *, allow_network=False):
+            seen_allow_network.append(allow_network)
+            if provider == "deepseek" and allow_network:
+                return models_dev.ModelCapabilities(supports_vision=False)
+            return None  # cold cache: no data unless a fetch is permitted
+
+        monkeypatch.setattr(models_dev, "get_model_capabilities", _text_only_catalog)
+
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (
@@ -187,6 +212,10 @@ model:
             "no vision-capable aggregator is available, not return a client "
             "that will fail at API time"
         )
+        # Asserted after the call, not inside the stub: an AssertionError
+        # raised there is swallowed by the defensive except blocks on the
+        # lookup path and would surface only as the opaque client check.
+        assert seen_allow_network and all(seen_allow_network), seen_allow_network
 
     def test_vision_capable_main_used(self, isolated_home, monkeypatch):
         """Vision-capable main provider should be returned by auto chain."""
