@@ -527,6 +527,128 @@ class TestWindowsAbsolutePathFolding:
         assert key is None
 
 
+class TestSingleComponentHomeFolding:
+    """A one-component home must fold to ``~/`` exactly like ``/home/alice``.
+
+    Regression: ``_home_prefix_fold_regex`` rejected every home with fewer than
+    two path components to neutralize stray HOME values (``/``, ``C:\\``, ``""``).
+    That guard also rejected ``/root`` — the real home of a Hermes run as uid 0
+    on a VPS or in a generic container — so ``cat key >> /root/.ssh/authorized_keys``
+    was never folded and the ``~/.ssh`` approval patterns never saw it.
+
+    HOME is monkeypatched (the fold consults ``$HOME`` directly) so the contract
+    is verified on every CI host, not only when the runner happens to be root."""
+
+    def test_root_home_sensitive_write_requires_approval(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+        for cmd in (
+            "cat key >> /root/.ssh/authorized_keys",
+            "echo 'pwned' > /root/.bashrc",
+            "cp key /root/.ssh/authorized_keys",
+            "sed -i 's/a/b/' /root/.netrc",
+            "cat key >> '/root/.ssh/authorized_keys'",
+        ):
+            dangerous, key, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+            assert key is not None, cmd
+
+    def test_root_home_unrelated_path_not_flagged(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+        dangerous, key, _ = detect_dangerous_command("cp report.txt /root/notes.txt")
+        assert dangerous is False
+        assert key is None
+
+    def test_root_home_recursive_delete_is_hardline(self, monkeypatch):
+        # ``rm -rf /home/alice/`` reaches the unconditional floor through the
+        # folded ``~/`` form; a root-run Hermes must get the same floor for its
+        # own home, including the trailing-slash spelling the bare ``/root``
+        # alternative in _HARDLINE_SYSTEM_DIRS does not cover.
+        monkeypatch.setenv("HOME", "/root")
+        for cmd in ("rm -rf /root/", "rm -rf /root/*", "rm -rf /root"):
+            assert detect_hardline_command(cmd)[0] is True, cmd
+
+    def test_single_component_hermes_home_folds(self, monkeypatch):
+        # A one-component HERMES_HOME (``/hermes`` in a container) must fold to
+        # ``~/.hermes/`` so the in-place-edit rule for config.yaml — the file
+        # that holds the approval policy itself — sees it.
+        monkeypatch.setenv("HERMES_HOME", "/hermes")
+        dangerous, key, _ = detect_dangerous_command(
+            "sed -i 's/manual/off/' /hermes/config.yaml"
+        )
+        assert dangerous is True
+        assert key is not None
+
+    def test_lone_home_component_never_matches_mid_token(self, monkeypatch):
+        # A single-component home is anchored on its leading separator and must
+        # not be preceded by a path character, so ``root`` buried inside another
+        # path, a variable expansion, or a longer name is never rewritten.
+        monkeypatch.setenv("HOME", "/root")
+        for cmd in (
+            "cp key /srv/root/.ssh/authorized_keys",
+            "cp key ./root/.ssh/authorized_keys",
+            "cp key ../root/.ssh/authorized_keys",
+            "cp key ${DIR}/root/.ssh/authorized_keys",
+            "cp key $(pwd)/root/.ssh/authorized_keys",
+            "cp key /newroot/.ssh/authorized_keys",
+            "cp key chroot/.ssh/authorized_keys",
+        ):
+            normalized = approval_module._normalize_command_for_detection(cmd)
+            assert "~" not in normalized, cmd
+        # Only the genuinely different paths are asserted safe. ``./root``,
+        # ``${DIR}/root`` and ``$(pwd)/root`` resolve to /root/.ssh when cwd or
+        # DIR is ``/``; the static detector cannot see that today, and this test
+        # must not enshrine those shapes as expected-safe.
+        for cmd in (
+            "cp key /srv/root/.ssh/authorized_keys",
+            "cp key /newroot/.ssh/authorized_keys",
+            "cp key chroot/.ssh/authorized_keys",
+        ):
+            dangerous, key, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+            assert key is None, cmd
+
+    def test_multi_component_home_not_folded_inside_another_path(self, monkeypatch):
+        # Pre-existing mangle: ``/opt/home/alice/.netrc`` became ``/opt~/.netrc``
+        # and the ``.*``-anchored tee / sed -i rules then raised a spurious
+        # prompt. The fold must only match the home at a token start.
+        monkeypatch.setenv("HOME", "/home/alice")
+        for cmd in (
+            "sed -i 's/a/b/' /opt/home/alice/.netrc",
+            "echo x | tee /opt/home/alice/.bashrc",
+            "cp key $BACKUPS/home/alice/.ssh/authorized_keys",
+        ):
+            normalized = approval_module._normalize_command_for_detection(cmd)
+            assert "~" not in normalized, cmd
+            dangerous, key, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+            assert key is None, cmd
+
+    def test_degenerate_home_never_folds(self, monkeypatch):
+        # A stray HOME of ``/``, ``""`` or a bare drive root must not rewrite
+        # unrelated absolute paths into ``~/...`` (which would then be matched
+        # by the user-sensitive patterns, or make every absolute path look
+        # home-relative in allowlist proposals).
+        for home in ("/", "", "C:\\", "C:"):
+            monkeypatch.setenv("HOME", home)
+            normalized = approval_module._normalize_command_for_detection(
+                "cp report.txt /tmp/notes.txt"
+            )
+            assert "~" not in normalized, repr(home)
+
+    def test_system_directory_home_never_hides_system_literals(self, monkeypatch):
+        # Debian's ``sys`` account has HOME=/dev and ``bin`` has HOME=/bin. A
+        # home that IS a protected system directory must not fold, or the
+        # ``/dev/sd`` and ``/etc/`` literals the hardline and system-config
+        # rules key on would be rewritten to ``~/sda`` / ``~/sudoers`` and the
+        # unconditional floor would never see them.
+        monkeypatch.setenv("HOME", "/dev")
+        assert detect_hardline_command("dd if=/dev/zero of=/dev/sda")[0] is True
+        assert detect_dangerous_command("echo x > /dev/sda")[0] is True
+        monkeypatch.setenv("HOME", "/etc")
+        assert detect_dangerous_command("echo x > /etc/sudoers")[0] is True
+        assert detect_dangerous_command("sed -i 's/x/y/' /etc/passwd")[0] is True
+
+
 class TestProjectSensitiveTeePattern:
     def test_tee_to_dotenv_with_trailing_file_arg_requires_approval(self):
         # tee writes to every file argument, so `.env` is overwritten even when
