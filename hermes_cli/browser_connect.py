@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import ntpath
 import os
@@ -1040,6 +1041,27 @@ def is_browser_debug_ready(url: str, timeout: float = 1.0) -> bool:
 # on [::1]:9222 only — reachable, but invisible to an IPv4-only probe.
 _LOOPBACK_PROBE_HOSTS = ("127.0.0.1", "[::1]")
 _LOOPBACK_SOCKET_HOSTS = ("127.0.0.1", "::1")
+# errno values meaning "this loopback family does not exist here" — distinct
+# from EADDRINUSE / EACCES ("someone else holds the port"). Containers with
+# IPv6 disabled, kernels booted with ipv6.disable=1 and hosts with no ::1
+# configured raise these for every ::1 socket or bind while socket.has_ipv6
+# stays True, so the errno is the only reliable signal. Windows reports the
+# WSA variants on OSError.errno; names missing on a platform are dropped.
+_LOOPBACK_FAMILY_UNAVAILABLE_ERRNOS = frozenset(
+    v
+    for v in (
+        getattr(errno, name, None)
+        for name in (
+            "EAFNOSUPPORT",
+            "EADDRNOTAVAIL",
+            "EPROTONOSUPPORT",
+            "WSAEAFNOSUPPORT",
+            "WSAEADDRNOTAVAIL",
+            "WSAEPROTONOSUPPORT",
+        )
+    )
+    if v is not None
+)
 
 
 def discover_local_cdp_url(port: int, timeout: float = 1.0) -> str | None:
@@ -1077,29 +1099,63 @@ def local_port_in_use(port: int, timeout: float = 0.5) -> bool:
     return False
 
 
+def _loopback_bind_state(family: int, host: str, port: int) -> str:
+    """Probe one loopback literal; return ``"free"``, ``"busy"`` or ``"unavailable"``.
+
+    ``"unavailable"`` means the address family itself is not usable on
+    this host (see ``_LOOPBACK_FAMILY_UNAVAILABLE_ERRNOS``), so no browser
+    could be pushed onto it either — it must not count against the
+    candidate port. Any other failure is ``"busy"``.
+    """
+    import socket
+
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as exc:
+        return "unavailable" if exc.errno in _LOOPBACK_FAMILY_UNAVAILABLE_ERRNOS else "busy"
+    with sock:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+        except OSError as exc:
+            return "unavailable" if exc.errno in _LOOPBACK_FAMILY_UNAVAILABLE_ERRNOS else "busy"
+    return "free"
+
+
 def find_free_debug_port(preferred: int = DEFAULT_BROWSER_CDP_PORT, attempts: int = 10) -> int:
-    """Return the first port after ``preferred`` bindable on both loopbacks.
+    """Return the first port after ``preferred`` bindable on every loopback this host has.
 
     Used when ``preferred`` is occupied by a non-CDP application: rather
     than launching a browser into a bind conflict, pick a nearby free
-    port. Falls back to ``preferred + 1`` if nothing binds (the launch
-    will then fail with a clear browser-side error instead of silently
-    doing nothing).
+    port. On dual-stack hosts a candidate must bind on BOTH ``127.0.0.1``
+    and ``::1`` — a port squatted on one loopback would push the browser
+    onto the other (the Windows js-debug case). A loopback family the
+    host does not have at all (IPv6 disabled in a container, no ``::1``
+    configured) is skipped rather than treated as occupied; otherwise
+    every candidate would be rejected and the IPv4 probe would never run.
+    Falls back to ``preferred + 1`` if nothing binds (the launch will then
+    fail with a clear browser-side error instead of silently doing
+    nothing).
     """
     import socket
 
     for port in range(preferred + 1, preferred + 1 + attempts):
-        bindable = True
+        probed_any = False
+        busy = False
         for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-            try:
-                with socket.socket(family, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.bind((host, port))
-            except OSError:
-                bindable = False
+            state = _loopback_bind_state(family, host, port)
+            if state == "busy":
+                busy = True
                 break
-        if bindable:
+            if state == "free":
+                probed_any = True
+        if busy:
+            continue
+        if probed_any:
             return port
+        # Neither loopback family is usable on this host: nothing to probe
+        # with, so further candidates cannot be distinguished either.
+        break
     return preferred + 1
 
 

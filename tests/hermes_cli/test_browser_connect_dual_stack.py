@@ -10,6 +10,7 @@ whole connect past the desktop GUI's RPC timeout
 
 from __future__ import annotations
 
+import errno
 import socket
 import threading
 
@@ -107,3 +108,119 @@ class TestFindFreeDebugPort:
             pytest.skip("successor port unavailable to bind in this environment")
         finally:
             blocker.close()
+
+
+def _patch_ipv6_loopback(monkeypatch, *, on_socket=None, on_bind=None):
+    """Replace the ``::1`` side of ``socket.socket`` with a scripted stand-in.
+
+    IPv4 sockets are passed through untouched so the real IPv4 loopback
+    is still probed. ``on_socket()`` runs at construction
+    (raise there to simulate a host with no IPv6 stack), ``on_bind(address)``
+    runs at ``bind`` (raise there to simulate no ``::1`` address, or a
+    squatter). Neither fakes the host OS — it scripts one address family.
+    """
+    real_socket = socket.socket
+
+    class _StubV6:
+        family = socket.AF_INET6
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+        def close(self):
+            pass
+
+        def setsockopt(self, *args):
+            pass
+
+        def bind(self, address):
+            if on_bind is not None:
+                on_bind(address)
+
+    def factory(family=-1, type=-1, proto=-1, fileno=None):
+        if family == socket.AF_INET6:
+            if on_socket is not None:
+                on_socket()
+            return _StubV6()
+        return real_socket(family, type, proto, fileno)
+
+    monkeypatch.setattr(socket, "socket", factory)
+
+
+def _raise_errno(code: int):
+    def _raise(*_args, **_kwargs):
+        raise OSError(code, "simulated")
+
+    return _raise
+
+
+class TestFindFreeDebugPortIPv6Unavailable:
+    """Hosts with no usable IPv6 loopback (IPv6 disabled in a container,
+    ``ipv6.disable=1``): the ``::1`` probe must be skipped, not treated as
+    "occupied", or the IPv4 probe never influences the result."""
+
+    @pytest.mark.parametrize(
+        "patch_kwargs",
+        [
+            pytest.param({"on_socket": _raise_errno(errno.EAFNOSUPPORT)}, id="no-ipv6-stack"),
+            pytest.param({"on_bind": _raise_errno(errno.EADDRNOTAVAIL)}, id="no-::1-address"),
+        ],
+    )
+    def test_skips_ipv4_occupied_successor(self, monkeypatch, patch_kwargs):
+        preferred = _free_port()
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            blocker.bind(("127.0.0.1", preferred + 1))
+            blocker.listen(1)
+        except OSError:
+            blocker.close()
+            pytest.skip("successor port unavailable to bind in this environment")
+        try:
+            _patch_ipv6_loopback(monkeypatch, **patch_kwargs)
+            port = find_free_debug_port(preferred)
+            assert port != preferred + 1
+            assert port > preferred
+            # The chosen port must actually be free on the loopback the host
+            # has, with the squatter still holding preferred + 1.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
+                check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                check.bind(("127.0.0.1", port))
+        finally:
+            blocker.close()
+
+
+class TestFindFreeDebugPortDualStackIntent:
+    """The dual-stack contract is preserved: a port held on ``::1`` only is
+    still rejected, because a browser launched on it would be pushed onto
+    the IPv4 loopback and the squatter would win the IPv6 side."""
+
+    def test_ipv6_only_squatter_still_rejects_candidate(self, monkeypatch):
+        preferred = _free_port()
+        squatted = preferred + 1
+
+        def _bind(address):
+            if address[1] == squatted:
+                raise OSError(errno.EADDRINUSE, "simulated squatter")
+
+        _patch_ipv6_loopback(monkeypatch, on_bind=_bind)
+        port = find_free_debug_port(preferred)
+        assert port != squatted
+        assert port > preferred
+
+    def test_falls_back_when_no_loopback_family_usable(self, monkeypatch):
+        """Both families unusable is a degenerate host; keep the documented
+        ``preferred + 1`` fallback instead of looping or raising."""
+        preferred = _free_port()
+        real_socket = socket.socket
+
+        def factory(family=-1, type=-1, proto=-1, fileno=None):
+            if family in (socket.AF_INET, socket.AF_INET6):
+                raise OSError(errno.EAFNOSUPPORT, "simulated")
+            return real_socket(family, type, proto, fileno)
+
+        monkeypatch.setattr(socket, "socket", factory)
+        assert find_free_debug_port(preferred) == preferred + 1
